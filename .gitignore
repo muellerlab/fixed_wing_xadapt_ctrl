@@ -1,3 +1,4 @@
 *.pyc
 __pycache__
 *.gif
+trirotor_sim/build/

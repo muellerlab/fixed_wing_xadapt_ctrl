@@ -18,6 +18,8 @@ dependencies:
   - xz=5.4.6
   - zlib=1.2.13
   - pip:
+      - cmake            # builds the compiled trirotor sim (make sim)
+      - pybind11         # Python bindings for the compiled trirotor sim
       - coloredlogs==15.0.1
       - contourpy==1.3.0
       - cycler==0.12.1

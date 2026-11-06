@@ -1,3 +1,10 @@
+import os
+import sys
+# pyplot3d lives in third_party/ (git submodule)
+_THIRD_PARTY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "third_party")
+if _THIRD_PARTY not in sys.path:
+    sys.path.insert(0, _THIRD_PARTY)
+
 import numpy as np
 from matplotlib import pyplot as plt
 # %matplotlib inline

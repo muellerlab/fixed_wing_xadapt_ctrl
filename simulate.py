@@ -1,9 +1,15 @@
 from __future__ import print_function, division
 
+import os
+import sys
+# use this repo's submodules in third_party/ (py3dmath, pyplot3d)
+_THIRD_PARTY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "third_party")
+sys.path[:0] = [os.path.join(_THIRD_PARTY, "py3dmath"), _THIRD_PARTY]
+
 import numpy as np
 import matplotlib.pyplot as plt
 
-from py3dmath import Vec3, Rotation  
+from py3dmath import Vec3, Rotation
 from uav_sim.vehicle import Vehicle
 
 from uav_sim.positioncontroller import PositionController

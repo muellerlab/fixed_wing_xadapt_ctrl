@@ -1,6 +1,11 @@
 [submodule "py3dmath"]
-	path = py3dmath
+	path = third_party/py3dmath
 	url = git@github.com:muellerlab/py3dmath.git
 [submodule "pyplot3d"]
-	path = pyplot3d
+	path = third_party/pyplot3d
 	url = git@github.com:Dz298/pyplot-3d.git
+[submodule "third_party/GeneralCode"]
+	path = third_party/GeneralCode
+	url = git@github.com:muellerlab/GeneralCode.git
+	branch = darpa-trirotor
+	shallow = true

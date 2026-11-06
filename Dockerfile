@@ -28,6 +28,8 @@ RUN apt-get update && apt-get install -y \
     libsm6 \
     libxext6 \
     libxrender1 \
+    cmake \
+    libeigen3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN apt-get install -y python3-tk
@@ -45,7 +47,7 @@ RUN test -f setup.bash || (echo "please launch from the xadapt_ctrl folder!" && 
 RUN git submodule update --init --recursive
 
 # Install Python dependencies (py3dmath)
-WORKDIR /root/xadapt_ctrl/py3dmath
+WORKDIR /root/xadapt_ctrl/third_party/py3dmath
 RUN pip install -e .
 
 # Install required Python packages using pip
@@ -73,7 +75,8 @@ RUN pip install --no-cache-dir \
     scipy \
     six==1.16.0 \
     sympy==1.13.2 \
-    tzdata==2024.1
+    tzdata==2024.1 \
+    pybind11
 
 # Run the simulation
 CMD ["bash", "-c", "echo 'Have a safe flight!'"]

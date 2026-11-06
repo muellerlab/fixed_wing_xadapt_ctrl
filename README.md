@@ -43,17 +43,40 @@ git submodule update --init --recursive
 conda env create -f environment.yml
 conda activate xadap
 
-# Install py3dmath package
-cd py3dmath
+# Install py3dmath package (optional here: simulate.py / simulateC.py / animate.py
+# already put third_party/py3dmath and third_party/pyplot3d on the path themselves)
+cd third_party/py3dmath
 rm -rf py3dmath.egg-info
 pip install -e .
-cd ..
+cd ../..
 
 # Run the simulation
 python simulate.py
 ```
 
 If successful, you should see the simulation of trajectory tracking with our controller.
+
+## Compiled trirotor sim (GeneralCode)
+
+`simulateC.py` flies the trirotor from GeneralCode with the same current objectives as `simulate.py`. The vehicle physics (`Trirotor_T`), the onboard `TrirotorLogic` (rate controller, mixer and KF) and the offboard `TrirotorController` are compiled into one Python module, `GeneralCode`.
+
+GeneralCode is the submodule `third_party/GeneralCode`.
+
+```bash
+git submodule update --init --depth 1 third_party/GeneralCode
+git -C third_party/GeneralCode sparse-checkout set Common Components
+```
+
+Build the module (inside the `xadap` env), then run:
+
+```bash
+sudo apt install cmake g++ libeigen3-dev   
+pip install pybind11 cmake                 
+make sim                                   # builds trirotor_sim/build/GeneralCode*.so
+python simulateC.py                        # Run simulation
+```
+
+`make sim_clean` removes the build. Rerun `make sim` after changing anything in `trirotor_sim/` or the submodule.
 
 ## ⭐ Learning the Adaptive Controller ⭐
 
