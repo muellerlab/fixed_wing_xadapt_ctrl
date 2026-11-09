@@ -2,3 +2,4 @@
 __pycache__
 *.gif
 trirotor_sim/build/
+data/trirotor_data.csv
