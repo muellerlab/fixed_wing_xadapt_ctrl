@@ -15,9 +15,14 @@
 #include "Common/Math/Vec3.hpp"
 #include "Common/Time/ManualTimer.hpp"
 #include "Components/Logic/DarpaConstants.hpp"
+#include "Components/Logic/PX4FixedWingAngularVelocityController.hpp"
+#include "Components/Logic/PX4FixedWingAttitudeController.hpp"
 #include "Components/Logic/QuadcopterConstants.hpp"
+#include "Components/Offboard/CoordinatedFlightConditionSolver.hpp"
 #include "Components/Offboard/LinearAerodynamicModel.hpp"
+#include "Components/Offboard/QuadcopterController.hpp"
 #include "Components/Offboard/TrirotorController.hpp"
+#include "Components/Offboard/TrirotorFixedWingController.hpp"
 #include "Components/Simulation/Trirotor_T.hpp"
 
 namespace py = pybind11;
@@ -35,6 +40,9 @@ Rotationd Q(Eigen::Vector4d const &q) {
   return r;
 }
 Eigen::Vector4d Q(Rotationd const &r) { return Eigen::Vector4d(r[0], r[1], r[2], r[3]); }
+Vec3f Vf(Eigen::Vector3d const &v) { return Vec3f(float(v.x()), float(v.y()), float(v.z())); }
+Eigen::Vector3d Ef(Vec3f const &v) { return Eigen::Vector3d(v.x, v.y, v.z); }
+Rotationf Qf(Eigen::Vector4d const &q) { return Rotationf(Q(q)); }
 }  // namespace
 
 // float[2] struct members as read/write 2-element lists
@@ -110,6 +118,71 @@ PYBIND11_MODULE(GeneralCode, m) {
       .ARRAY2_FIELD(AeroCoeffs, AeroCoeffs, Cn_delta_aileron)
       .ARRAY2_FIELD(AeroCoeffs, AeroCoeffs, Cn_delta_tail);
 
+  using FWConsts = Consts::FixedWingControllerConstants;
+  py::class_<FWConsts>(m, "FixedWingControllerConstants")
+      .def_readwrite("posControl_natFreq_x", &FWConsts::posControl_natFreq_x)
+      .def_readwrite("posControl_natFreq_y", &FWConsts::posControl_natFreq_y)
+      .def_readwrite("posControl_natFreq_z", &FWConsts::posControl_natFreq_z)
+      .def_readwrite("posControl_damping_x", &FWConsts::posControl_damping_x)
+      .def_readwrite("posControl_damping_y", &FWConsts::posControl_damping_y)
+      .def_readwrite("posControl_damping_z", &FWConsts::posControl_damping_z)
+      .def_readwrite("attControl_timeConst_x", &FWConsts::attControl_timeConst_x)
+      .def_readwrite("attControl_timeConst_y", &FWConsts::attControl_timeConst_y)
+      .def_readwrite("attControl_timeConst_z", &FWConsts::attControl_timeConst_z)
+      .def_readwrite("attControl_integralGain", &FWConsts::attControl_integralGain)
+      .def_readwrite("attControl_integralLimit_x", &FWConsts::attControl_integralLimit_x)
+      .def_readwrite("attControl_integralLimit_y", &FWConsts::attControl_integralLimit_y)
+      .def_readwrite("attControl_integralLimit_z", &FWConsts::attControl_integralLimit_z)
+      .def_readwrite("angVelControl_timeConst_x", &FWConsts::angVelControl_timeConst_x)
+      .def_readwrite("angVelControl_timeConst_y", &FWConsts::angVelControl_timeConst_y)
+      .def_readwrite("angVelControl_timeConst_z", &FWConsts::angVelControl_timeConst_z)
+      .def_readwrite("angVelControl_Ki_x", &FWConsts::angVelControl_Ki_x)
+      .def_readwrite("angVelControl_Ki_y", &FWConsts::angVelControl_Ki_y)
+      .def_readwrite("angVelControl_Ki_z", &FWConsts::angVelControl_Ki_z)
+      .def_readwrite("angVelControl_useIntegral", &FWConsts::angVelControl_useIntegral);
+
+  using TecsConsts = Consts::TECSControllerConstants;
+  py::class_<TecsConsts>(m, "TECSControllerConstants")
+      .def_readwrite("throttle_Kp", &TecsConsts::throttle_Kp)
+      .def_readwrite("throttle_Ki", &TecsConsts::throttle_Ki)
+      .def_readwrite("pitch_Kp", &TecsConsts::pitch_Kp)
+      .def_readwrite("pitch_Ki", &TecsConsts::pitch_Ki)
+      .def_readwrite("energyDistributionWeight", &TecsConsts::energyDistributionWeight)
+      .def_readwrite("heightRateTimeConst", &TecsConsts::heightRateTimeConst)
+      .def_readwrite("maxClimbRateDemand", &TecsConsts::maxClimbRateDemand)
+      .def_readwrite("minClimbRateDemand", &TecsConsts::minClimbRateDemand)
+      .def_readwrite("maxAirspeedDemandRate", &TecsConsts::maxAirspeedDemandRate)
+      .def_readwrite("minCruiseAirspeed", &TecsConsts::minCruiseAirspeed)
+      .def_readwrite("maxCruiseAirspeed", &TecsConsts::maxCruiseAirspeed)
+      .def_readwrite("minPitchAngle", &TecsConsts::minPitchAngle)
+      .def_readwrite("maxPitchAngle", &TecsConsts::maxPitchAngle)
+      .def_readwrite("minThrust", &TecsConsts::minThrust)
+      .def_readwrite("maxThrust", &TecsConsts::maxThrust)
+      .def_readwrite("throttleTrim", &TecsConsts::throttleTrim)
+      .def_readwrite("pitchTrim", &TecsConsts::pitchTrim)
+      .def_readwrite("throttleIntegratorLimit", &TecsConsts::throttleIntegratorLimit)
+      .def_readwrite("pitchIntegratorLimit", &TecsConsts::pitchIntegratorLimit)
+      .def_readwrite("loadFactorCompensationGain", &TecsConsts::loadFactorCompensationGain);
+
+  using TecsOut = Onboard::TrirotorTecsController::TecsOutput;
+  py::class_<TecsOut>(m, "TecsOutput")
+      .def_readonly("thrust", &TecsOut::thrust)            // [N]
+      .def_readonly("pitchAngle", &TecsOut::pitchAngle)    // [rad]
+      .def_readonly("heightDemandFiltered", &TecsOut::heightDemandFiltered)
+      .def_readonly("airspeedDemandFiltered", &TecsOut::airspeedDemandFiltered)
+      .def_readonly("speError", &TecsOut::speError)
+      .def_readonly("skeError", &TecsOut::skeError)
+      .def_readonly("steError", &TecsOut::steError)
+      .def_readonly("sebError", &TecsOut::sebError)
+      .def_readonly("climbRateDemand", &TecsOut::climbRateDemand)
+      .def_readonly("throttleIntegrator", &TecsOut::throttleIntegrator)
+      .def_readonly("pitchIntegrator", &TecsOut::pitchIntegrator);
+
+  using LGConsts = Consts::LateralGuidanceConstants;
+  py::class_<LGConsts>(m, "LateralGuidanceConstants")
+      .def_readwrite("maxBankAngle", &LGConsts::maxBankAngle)
+      .def_readwrite("minHeadingSpeed", &LGConsts::minHeadingSpeed);
+
   // inertia_xx/yy/zz setters also update inertiaMatrix (used onboard), as the reference sim does.
   auto inertiaProp = [](int i) {
     return std::make_pair(
@@ -152,12 +225,22 @@ PYBIND11_MODULE(GeneralCode, m) {
       .def_readwrite("posControl_damping", &Consts::posControl_damping)
       .def_readwrite("attControl_timeConst_x", &Consts::attControl_timeConst_x)
       .def_readwrite("attControl_timeConst_y", &Consts::attControl_timeConst_y)
+      .def_readwrite("attControl_timeConst_xy", &Consts::attControl_timeConst_xy)
       .def_readwrite("attControl_timeConst_z", &Consts::attControl_timeConst_z)
       .def_readwrite("attControl_integralGain", &Consts::attControl_integralGain)
       .def_readwrite("attControl_integralLimit_x", &Consts::attControl_integralLimit_x)
       .def_readwrite("attControl_integralLimit_y", &Consts::attControl_integralLimit_y)
       .def_readwrite("attControl_integralLimit_z", &Consts::attControl_integralLimit_z)
       .def_readwrite("tiltServoDynamics", &Consts::tiltServoDynamics)
+      .def_readwrite("aileronServoDynamics", &Consts::aileronServoDynamics)
+      .def_readwrite("tailServoDynamics", &Consts::tailServoDynamics)
+      .def_readwrite("maxThrustPerPropeller", &Consts::maxThrustPerPropeller)
+      .def_readwrite("stabilizeMaxRoll", &Consts::stabilizeMaxRoll)
+      .def_readwrite("stabilizeMaxPitch", &Consts::stabilizeMaxPitch)
+      .def_readwrite("stabilizeMaxYawRate", &Consts::stabilizeMaxYawRate)
+      .def_readwrite("fixedWingControlConsts", &Consts::fixedWingControlConsts)
+      .def_readwrite("lateralGuidanceConsts", &Consts::lateralGuidanceConsts)
+      .def_readwrite("tecsControlConsts", &Consts::tecsControlConsts)
       .def_readwrite("wingParams", &Consts::wingParams)
       .def_readwrite("aeroCoeffs", &Consts::aeroCoeffs)
       .def_readwrite("simAeroCoeffs", &Consts::simAeroCoeffs);
@@ -191,6 +274,36 @@ PYBIND11_MODULE(GeneralCode, m) {
         py::arg("flags"), py::arg("vertical_thrust"), py::arg("forward_thrust"), py::arg("ang_vel"),
         py::arg("aileron_angles") = std::array<float, 2>{0, 0},
         py::arg("tail_angles") = std::array<float, 2>{0, 0});
+  // total mass-normalized thrust + body rates -> onboard external-rates mode (FS_EXTERNAL_RATES_CONTROL)
+  m.def("make_rates_command",
+        [](int flags, float thrust, Eigen::Vector3d const &angVel) {
+          RawMessage msg;
+          RadioTypes::RadioMessageDecoded::CreateRatesCommand(
+              uint8_t(flags), thrust, Vec3f(float(angVel.x()), float(angVel.y()), float(angVel.z())),
+              msg.raw);
+          return msg;
+        },
+        py::arg("flags"), py::arg("thrust"), py::arg("ang_vel"));
+  m.def("make_forward_wing_command",
+        [](int flags, float forwardThrust, Eigen::Vector3d const &angVel) {
+          RawMessage msg;
+          RadioTypes::RadioMessageDecoded::CreateTrirotorForwardWingCommand(
+              uint8_t(flags), forwardThrust,
+              Vec3f(float(angVel.x()), float(angVel.y()), float(angVel.z())), msg.raw);
+          return msg;
+        },
+        py::arg("flags"), py::arg("forward_thrust"), py::arg("ang_vel"));
+  // attitude setpoint + total thrust [N] -> onboard PX4 attitude/rate loops (FS_TRIMOTOR_ATTITUDE_CONTROL)
+  m.def("make_attitude_command",
+        [](int flags, float thrust, Eigen::Vector4d const &att) {
+          RawMessage msg;
+          Rotationd const q = Q(att);
+          float const desAtt[4] = {float(q[0]), float(q[1]), float(q[2]), float(q[3])};
+          RadioTypes::RadioMessageDecoded::CreateTrirotorAttitudeCommand(uint8_t(flags), thrust,
+                                                                       desAtt, msg.raw);
+          return msg;
+        },
+        py::arg("flags"), py::arg("thrust"), py::arg("att"));
 
   // ---------------------------------------------------------------- vehicle (physics + onboard logic)
   py::class_<Simulation::Trirotor>(m, "Trirotor")
@@ -255,6 +368,12 @@ PYBIND11_MODULE(GeneralCode, m) {
       })
       .def("tilt_angles", [](Simulation::Trirotor const &t) {
         return Eigen::Vector2d(t.GetSimMotorAngle(0), t.GetSimMotorAngle(1));
+      })
+      .def("aileron_angles", [](Simulation::Trirotor const &t) {  // actual (R, L) [rad]
+        return Eigen::Vector2d(t.GetSimAileronAngle(0), t.GetSimAileronAngle(1));
+      })
+      .def("tail_angles", [](Simulation::Trirotor const &t) {  // actual (R, L) ruddervators [rad]
+        return Eigen::Vector2d(t.GetSimTailSurfaceAngle(0), t.GetSimTailSurfaceAngle(1));
       });
 
   // ---------------------------------------------------------------- offboard controller
@@ -279,4 +398,206 @@ PYBIND11_MODULE(GeneralCode, m) {
            },
            py::arg("pos"), py::arg("vel"), py::arg("att"), py::arg("des_pos"), py::arg("des_vel"),
            py::arg("des_acc"), py::arg("des_pitch"), py::arg("des_yaw"), py::arg("dt"));
+
+  // Generic multirotor position/attitude controller (the reference sim's hover branch with
+  // forwardControl = false): returns (cmd_ang_vel, cmd_thrust) -> make_rates_command
+  py::class_<Offboard::QuadcopterController>(m, "QuadcopterController")
+      .def(py::init<>())
+      .def("set_parameters", &Offboard::QuadcopterController::SetParameters,
+           py::arg("pos_nat_freq"), py::arg("pos_damping"), py::arg("att_time_const_xy"),
+           py::arg("att_time_const_z"))
+      .def("run",
+           [](Offboard::QuadcopterController const &c, Eigen::Vector3d const &pos,
+              Eigen::Vector3d const &vel, Eigen::Vector4d const &att, Eigen::Vector3d const &desPos,
+              Eigen::Vector3d const &desVel, Eigen::Vector3d const &desAcc, double desYaw) {
+             Vec3d angVel(0, 0, 0);
+             double thrust = 0;
+             c.Run(V(pos), V(vel), Q(att), V(desPos), V(desVel), V(desAcc), desYaw, angVel, thrust);
+             return py::make_tuple(E(angVel), thrust);
+           },
+           py::arg("pos"), py::arg("vel"), py::arg("att"), py::arg("des_pos"), py::arg("des_vel"),
+           py::arg("des_acc"), py::arg("des_yaw"));
+
+  // ---------------------------------------------------------------- flight condition solver
+  using FCS = Offboard::CoordinatedFlightConditionSolver;
+  py::enum_<FCS::SolveStatus>(m, "SolveStatus")
+      .value("OK", FCS::SOLVE_OK)                  // exact solution inside the AoA limits
+      .value("NO_BRACKET", FCS::SOLVE_NO_BRACKET)  // not achievable inside the AoA limits, best effort
+      .value("DEGENERATE", FCS::SOLVE_DEGENERATE)  // airspeed ~0: identity attitude, zero thrust
+      .export_values();
+
+  py::class_<FCS::FlightCondition>(m, "FlightCondition")
+      .def_property_readonly("att", [](FCS::FlightCondition const &f) { return Q(f.desAtt); })  // (w,x,y,z)
+      .def_readonly("alpha", &FCS::FlightCondition::alpha)  // angle of attack [rad]
+      .def_readonly("T", &FCS::FlightCondition::T)          // thrust
+      .def_readonly("have_bracket", &FCS::FlightCondition::have_bracket)
+      .def_readonly("status", &FCS::FlightCondition::status);
+
+  // Attitude + thrust for a given air-relative velocity and required proper acceleration (incl. the
+  // +9.81 z gravity offset, as TrirotorFixedWingController passes it).
+  py::class_<FCS>(m, "CoordinatedFlightConditionSolver")
+      .def(py::init<Offboard::LinearAerodynamicModel>(), py::arg("aero_model"))
+      .def("solve",
+           [](FCS const &s, Eigen::Vector3d const &airVel, Eigen::Vector3d const &properAcc) {
+             return s.SolveFlightConditionSolver(V(airVel), V(properAcc));
+           },
+           py::arg("air_velocity"), py::arg("proper_acc"))
+      .def("T_par", &FCS::GetTpar)
+      .def("T_perp", &FCS::GetTperp);
+
+  // ---------------------------------------------------------------- forward flight (offboard)
+  py::class_<Offboard::TrirotorFixedWingController>(m, "TrirotorFixedWingController")
+      .def(py::init<Offboard::LinearAerodynamicModel>(), py::arg("aero_model"))
+      .def("set_parameters", &Offboard::TrirotorFixedWingController::SetParameters,
+           py::arg("pos_nat_freq_x"), py::arg("pos_nat_freq_y"), py::arg("pos_nat_freq_z"),
+           py::arg("pos_damping_x"), py::arg("pos_damping_y"), py::arg("pos_damping_z"),
+           py::arg("att_time_const_x"), py::arg("att_time_const_y"), py::arg("att_time_const_z"),
+           py::arg("att_integral_gain"), py::arg("att_integral_limit_x"),
+           py::arg("att_integral_limit_y"), py::arg("att_integral_limit_z"))
+      .def("set_lateral_guidance_parameters",
+           &Offboard::TrirotorFixedWingController::SetLateralGuidanceParameters,
+           py::arg("max_bank_angle"), py::arg("min_heading_speed"))
+      .def("set_tecs_parameters", &Offboard::TrirotorFixedWingController::SetTecsParameters,
+           py::arg("throttle_Kp"), py::arg("throttle_Ki"), py::arg("pitch_Kp"), py::arg("pitch_Ki"),
+           py::arg("energy_distribution_weight"), py::arg("height_rate_time_const"),
+           py::arg("max_climb_rate_demand"), py::arg("min_climb_rate_demand"),
+           py::arg("max_airspeed_demand_rate"), py::arg("min_pitch_angle"), py::arg("max_pitch_angle"),
+           py::arg("min_thrust"), py::arg("max_thrust"), py::arg("throttle_trim"), py::arg("pitch_trim"),
+           py::arg("throttle_integrator_limit"), py::arg("pitch_integrator_limit"),
+           py::arg("load_factor_compensation_gain"))
+      .def("reset_tecs", &Offboard::TrirotorFixedWingController::ResetTecs)
+      // TECS (energy loops for thrust/pitch + lateral guidance for bank) + offboard attitude loop:
+      // returns (cmd_ang_vel, cmd_forward_thrust). Steady cruise only, not the VTOL transition.
+      .def("run_tecs",
+           [](Offboard::TrirotorFixedWingController const &c, Eigen::Vector3d const &pos,
+              Eigen::Vector3d const &vel, Eigen::Vector4d const &att, Eigen::Vector3d const &desPos,
+              Eigen::Vector3d const &desVel, Eigen::Vector3d const &desAcc,
+              Eigen::Vector3d const &groundWind, double dt) {
+             Vec3d angVel(0, 0, 0);
+             double forwardThrust = 0;
+             c.RunTecs(V(pos), V(vel), Q(att), V(desPos), V(desVel), V(desAcc), V(groundWind), angVel,
+                       forwardThrust, float(dt));
+             return py::make_tuple(E(angVel), forwardThrust);
+           },
+           py::arg("pos"), py::arg("vel"), py::arg("att"), py::arg("des_pos"), py::arg("des_vel"),
+           py::arg("des_acc"), py::arg("ground_wind"), py::arg("dt"))
+      // TECS without the attitude loop: returns (att_setpoint (w,x,y,z), thrust [N]) -> make_attitude_command
+      .def("run_tecs_attitude_setpoint",
+           [](Offboard::TrirotorFixedWingController const &c, Eigen::Vector3d const &pos,
+              Eigen::Vector3d const &vel, Eigen::Vector4d const &att, Eigen::Vector3d const &desPos,
+              Eigen::Vector3d const &desVel, Eigen::Vector3d const &desAcc,
+              Eigen::Vector3d const &groundWind, double dt) {
+             Rotationd desAtt;
+             double thrust = 0;
+             c.RunTecsAttitudeSetpoint(V(pos), V(vel), Q(att), V(desPos), V(desVel), V(desAcc),
+                                       V(groundWind), desAtt, thrust, float(dt));
+             return py::make_tuple(Q(desAtt), thrust);
+           },
+           py::arg("pos"), py::arg("vel"), py::arg("att"), py::arg("des_pos"), py::arg("des_vel"),
+           py::arg("des_acc"), py::arg("ground_wind"), py::arg("dt"))
+      .def("tecs_output", &Offboard::TrirotorFixedWingController::GetTecsOutput)
+      .def("tecs_cmd_bank_angle", &Offboard::TrirotorFixedWingController::GetTecsCmdBankAngle)
+      .def("tecs_cmd_yaw_angle", &Offboard::TrirotorFixedWingController::GetTecsCmdYawAngle)
+      .def("set_min_max_acceleration", &Offboard::TrirotorFixedWingController::SetMinMaxAcceleration,
+           py::arg("min_vertical_proper_acc"), py::arg("max_proper_acc"), py::arg("min_proper_acc") = -1.0)
+      .def("reset_att_integral", &Offboard::TrirotorFixedWingController::ResetAttIntegral)
+      .def("att_integral", [](Offboard::TrirotorFixedWingController const &c) { return Ef(c.GetAttIntegral()); })
+      // Position control + flight condition solver, no attitude loop (the PX4 attitude loop runs
+      // onboard): returns (att_setpoint (w,x,y,z), thrust [N], status) -> make_attitude_command
+      .def("run_attitude_setpoint",
+           [](Offboard::TrirotorFixedWingController const &c, Eigen::Vector3d const &pos,
+              Eigen::Vector3d const &vel, Eigen::Vector3d const &desPos, Eigen::Vector3d const &desVel,
+              Eigen::Vector3d const &desAcc, Eigen::Vector3d const &groundWind) {
+             Rotationd desAtt;
+             double thrust = 0;
+             auto const status = c.RunAttitudeSetpoint(V(pos), V(vel), V(desPos), V(desVel), V(desAcc),
+                                                       V(groundWind), desAtt, thrust);
+             return py::make_tuple(Q(desAtt), thrust, status);
+           },
+           py::arg("pos"), py::arg("vel"), py::arg("des_pos"), py::arg("des_vel"), py::arg("des_acc"),
+           py::arg("ground_wind"))
+      // Flight condition solver + offboard attitude loop from a commanded proper acceleration:
+      // returns (cmd_ang_vel, cmd_forward_thrust)
+      .def("run_accel",
+           [](Offboard::TrirotorFixedWingController const &c, Eigen::Vector3d const &cmdProperAcc,
+              Eigen::Vector3d const &vel, Eigen::Vector4d const &att, Eigen::Vector3d const &groundWind,
+              double dt) {
+             Vec3d angVel(0, 0, 0);
+             double forwardThrust = 0;
+             c.RunAccel(Vf(cmdProperAcc), V(vel), Q(att), V(groundWind), angVel, forwardThrust, float(dt));
+             return py::make_tuple(E(angVel), forwardThrust);
+           },
+           py::arg("cmd_proper_acc"), py::arg("vel"), py::arg("att"), py::arg("ground_wind"), py::arg("dt"))
+      // Offboard attitude loop only: returns (cmd_ang_vel, cmd_forward_thrust)
+      .def("run_attitude",
+           [](Offboard::TrirotorFixedWingController const &c, double thrust, Eigen::Vector4d const &desAtt,
+              Eigen::Vector4d const &att, double dt) {
+             Vec3d angVel(0, 0, 0);
+             double forwardThrust = 0;
+             c.RunAttitude(thrust, Q(desAtt), Q(att), angVel, forwardThrust, float(dt));
+             return py::make_tuple(E(angVel), forwardThrust);
+           },
+           py::arg("thrust"), py::arg("des_att"), py::arg("att"), py::arg("dt"))
+      // internals of the last run (for logging)
+      .def("flight_condition", &Offboard::TrirotorFixedWingController::GetFlightCondition)
+      .def("cmd_acc", [](Offboard::TrirotorFixedWingController const &c) { return E(c.GetCmdAcc()); })
+      .def("cmd_proper_acc", [](Offboard::TrirotorFixedWingController const &c) { return E(c.GetCmdProperAcc()); })
+      .def("cmd_att_yawed", [](Offboard::TrirotorFixedWingController const &c) { return E(c.GetCmdAttYawed()); })
+      .def("feedback", [](Offboard::TrirotorFixedWingController const &c) { return E(c.GetFeedback()); })
+      .def("cmd_alpha", &Offboard::TrirotorFixedWingController::GetCmdAlpha)
+      .def("cmd_thrust", &Offboard::TrirotorFixedWingController::GetCmdThrust)
+      .def("solver_T_par", &Offboard::TrirotorFixedWingController::GetFlightConditionSolverTpar)
+      .def("solver_T_perp", &Offboard::TrirotorFixedWingController::GetFlightConditionSolverTperp)
+      // Full chain incl. offboard attitude loop: returns (cmd_ang_vel, cmd_forward_thrust)
+      .def("run",
+           [](Offboard::TrirotorFixedWingController const &c, Eigen::Vector3d const &pos,
+              Eigen::Vector3d const &vel, Eigen::Vector4d const &att, Eigen::Vector3d const &desPos,
+              Eigen::Vector3d const &desVel, Eigen::Vector3d const &desAcc,
+              Eigen::Vector3d const &groundWind, double dt) {
+             Vec3d angVel(0, 0, 0);
+             double forwardThrust = 0;
+             c.Run(V(pos), V(vel), Q(att), V(desPos), V(desVel), V(desAcc), V(groundWind), angVel,
+                   forwardThrust, float(dt));
+             return py::make_tuple(E(angVel), forwardThrust);
+           },
+           py::arg("pos"), py::arg("vel"), py::arg("att"), py::arg("des_pos"), py::arg("des_vel"),
+           py::arg("des_acc"), py::arg("ground_wind"), py::arg("dt"));
+
+  // ---------------------------------------------------------------- PX4 fixed-wing controllers (onboard)
+  // The same classes TrirotorLogic runs in FS_TRIMOTOR_ATTITUDE_CONTROL; exposed standalone so an
+  // environment can evaluate them (e.g. as a reference/expert) outside the onboard logic.
+  py::class_<Onboard::PX4FixedWingAttitudeController>(m, "PX4FixedWingAttitudeController")
+      .def(py::init<>())
+      .def("set_parameters", &Onboard::PX4FixedWingAttitudeController::SetParameters,
+           py::arg("time_const_x"), py::arg("time_const_y"))
+      .def("time_constants",
+           [](Onboard::PX4FixedWingAttitudeController const &c) { return Ef(c.GetTimeConstants()); })
+      .def("desired_angular_velocity",
+           [](Onboard::PX4FixedWingAttitudeController const &c, Eigen::Vector4d const &desAtt,
+              Eigen::Vector4d const &estAtt, double trueAirspeed, double cmdYawRate) {
+             return Ef(c.GetDesiredAngularVelocity(Qf(desAtt), Qf(estAtt), float(trueAirspeed),
+                                                   float(cmdYawRate)));
+           },
+           py::arg("des_att"), py::arg("est_att"), py::arg("true_airspeed"), py::arg("cmd_yaw_rate") = 0.0);
+
+  py::class_<Onboard::PX4FixedWingAngularVelocityController>(m, "PX4FixedWingAngularVelocityController")
+      .def(py::init<>())
+      .def("set_parameters",
+           [](Onboard::PX4FixedWingAngularVelocityController &c, Eigen::Vector3d const &Kp,
+              Eigen::Vector3d const &Ki, Eigen::Vector3d const &Kff, Eigen::Vector3d const &integralLimit,
+              double trimAirspeed) {
+             c.SetParameters(Vf(Kp), Vf(Ki), Vf(Kff), Vf(integralLimit), float(trimAirspeed));
+           },
+           py::arg("Kp"), py::arg("Ki"), py::arg("Kff"), py::arg("integral_limit"), py::arg("trim_airspeed"))
+      .def("set_trim_airspeed", &Onboard::PX4FixedWingAngularVelocityController::SetTrimAirspeed,
+           py::arg("trim_airspeed"))
+      .def("reset_integral", &Onboard::PX4FixedWingAngularVelocityController::ResetIntegral)
+      // normalized pseudo-torques in [-1, 1] (roll, pitch, yaw)
+      .def("desired_normalized_torques",
+           [](Onboard::PX4FixedWingAngularVelocityController &c, Eigen::Vector3d const &desAngVel,
+              Eigen::Vector3d const &estAngVel, double trueAirspeed, double dt) {
+             return Ef(c.GetDesiredNormalizedTorques(Vf(desAngVel), Vf(estAngVel), float(trueAirspeed),
+                                                     float(dt)));
+           },
+           py::arg("des_ang_vel"), py::arg("est_ang_vel"), py::arg("true_airspeed"), py::arg("dt"));
 }

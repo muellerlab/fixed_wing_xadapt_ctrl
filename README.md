@@ -58,7 +58,7 @@ If successful, you should see the simulation of trajectory tracking with our con
 
 ## Compiled trirotor sim (GeneralCode)
 
-`simulateC.py` flies the trirotor from GeneralCode with the same current objectives as `simulate.py`. The vehicle physics (`Trirotor_T`), the onboard `TrirotorLogic` (rate controller, mixer and KF) and the offboard `TrirotorController` are compiled into one Python module, `GeneralCode`.
+`simulateC.py` is a sanity check of the trirotor controllers and simulation from GeneralCode. This is used to validate that inhereted controllers and simulation interact with the environment as intended.
 
 GeneralCode is the submodule `third_party/GeneralCode`.
 
@@ -73,7 +73,8 @@ Build the module (inside the `xadap` env), then run:
 sudo apt install cmake g++ libeigen3-dev   
 pip install pybind11 cmake                 
 make sim                                   # builds trirotor_sim/build/GeneralCode*.so
-python simulateC.py                        # Run simulation
+python simulateC.py                        # forward flight at 15 m/s trim, all 4 controller variants
+python simulateC.py --mode hover           # level hover, both hover controllers
 ```
 
 `make sim_clean` removes the build. Rerun `make sim` after changing anything in `trirotor_sim/` or the submodule.
