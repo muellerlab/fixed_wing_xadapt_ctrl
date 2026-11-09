@@ -35,10 +35,18 @@ dependencies:
       - packaging==24.1
       - pandas==2.2.2
       - pillow==10.4.0
-      - protobuf==5.28.0
+      - protobuf==5.29.6
       - python-dateutil==2.9.0.post0
       - pytz==2024.1
       - scipy==1.14.1
       - six==1.16.0
       - sympy==1.13.2
       - tzdata==2024.1
+      # Training (learning/). ppo.py needs stable-baselines3 1.5.0, which needs gym 0.21.0. Install gym first
+      # and separately: its setup.py has an invalid requirement that current build tools reject, so download
+      # the 0.21.0 sdist, change "opencv-python>=3." to "opencv-python>=3" in setup.py, and pip install that folder.
+      - stable-baselines3==1.5.0
+      - torch==2.4.1
+      - tensorboard==2.20.0
+      - wandb==0.31.0
+      - ruamel.yaml==0.17.40

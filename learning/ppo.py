@@ -1,4 +1,6 @@
+import math
 import os
+import time
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
@@ -13,11 +15,65 @@ from stable_baselines3.common.base_class import BaseAlgorithm
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
-from stable_baselines3.common.utils import safe_mean
+from stable_baselines3.common.utils import explained_variance, get_schedule_fn, safe_mean
+from stable_baselines3.common.buffers import RolloutBuffer
+import torch.nn.functional as F
+from ruamel.yaml import YAML
+from typing import Generator, NamedTuple
 from stable_baselines3.common.vec_env import VecEnv
 
 import wandb
 from collections import defaultdict
+
+class Ph1RolloutBufferSamples(NamedTuple):
+    observations: th.Tensor
+    actions: th.Tensor
+    privileged_actions: th.Tensor
+    old_values: th.Tensor
+    old_log_prob: th.Tensor
+    advantages: th.Tensor
+    returns: th.Tensor
+
+
+class Ph1RolloutBuffer(RolloutBuffer):
+    """SB3 RolloutBuffer that also stores the expert (privileged) action for behaviour cloning."""
+
+    def reset(self) -> None:
+        self.privileged_actions = np.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=np.float32)
+        super().reset()
+
+    def add(self, obs, action, privileged_action, reward, episode_start, value, log_prob) -> None:
+        self.privileged_actions[self.pos] = np.array(privileged_action).reshape((self.n_envs, self.action_dim))
+        super().add(obs, action, reward, episode_start, value, log_prob)
+
+    def get(self, batch_size: Optional[int] = None) -> Generator[Ph1RolloutBufferSamples, None, None]:
+        assert self.full, ""
+        indices = np.random.permutation(self.buffer_size * self.n_envs)
+        if not self.generator_ready:
+            for name in ("observations", "actions", "privileged_actions", "values", "log_probs", "advantages", "returns"):
+                self.__dict__[name] = self.swap_and_flatten(self.__dict__[name])
+            self.generator_ready = True
+
+        if batch_size is None:
+            batch_size = self.buffer_size * self.n_envs
+
+        start_idx = 0
+        while start_idx < self.buffer_size * self.n_envs:
+            yield self._get_samples(indices[start_idx : start_idx + batch_size])
+            start_idx += batch_size
+
+    def _get_samples(self, batch_inds: np.ndarray, env=None) -> Ph1RolloutBufferSamples:
+        data = (
+            self.observations[batch_inds],
+            self.actions[batch_inds],
+            self.privileged_actions[batch_inds],
+            self.values[batch_inds].flatten(),
+            self.log_probs[batch_inds].flatten(),
+            self.advantages[batch_inds].flatten(),
+            self.returns[batch_inds].flatten(),
+        )
+        return Ph1RolloutBufferSamples(*tuple(map(self.to_torch, data)))
+
 
 class OnPolicyAlgorithm(BaseAlgorithm):
     """
@@ -204,6 +260,8 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         assert self._last_obs is not None, "No previous observation was provided"
         n_steps = 0
         rollout_buffer.reset()
+        self._sim_time = 0.0  # [s] wall time spent stepping the environments this rollout
+        self._inference_time = 0.0  # [s] wall time spent in the policy network this rollout
 
         # Sample new weights for the state dependent exploration
         if self.use_sde:
@@ -226,7 +284,11 @@ class OnPolicyAlgorithm(BaseAlgorithm):
             with th.no_grad():
                 # Convert to pytorch tensor and get actions
                 obs_tensor = th.as_tensor(obs_norm).to(self.device)
+                inference_start = time.perf_counter()
                 actions, values, log_probs = self.policy.forward(obs_tensor)
+                if self.device.type == "cuda":
+                    th.cuda.synchronize()  # GPU work is asynchronous: wait for it, or the timing is too short
+                self._inference_time += time.perf_counter() - inference_start
             actions = actions.cpu().numpy()
 
             # Clip actions if needed
@@ -237,8 +299,10 @@ class OnPolicyAlgorithm(BaseAlgorithm):
                 )
 
             # Perform action in environment
+            sim_start = time.perf_counter()
             new_obs, rewards, dones, infos = env.step(clipped_actions)
             privileged_actions = env.getQuadPrivAct()
+            self._sim_time += time.perf_counter() - sim_start
             self.num_timesteps += env.num_envs
 
             # Update callback
@@ -279,7 +343,7 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         self,
         total_timesteps: int,
         callback: MaybeCallback = None,
-        log_interval: Tuple = (10, 100),
+        log_interval: Tuple = (25, 25),  # (eval every N iterations, save a checkpoint every N iterations)
         eval_env: Optional[GymEnv] = None,
         eval_freq: int = -1,
         n_eval_episodes: int = 5,
@@ -343,9 +407,12 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         while self.num_timesteps < total_timesteps:
 
             # Collect rollouts
+            rollout_start = time.perf_counter()
             continue_training = self.collect_rollouts(
                 self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_steps
             )
+
+            rollout_time = time.perf_counter() - rollout_start
 
             if continue_training is False:
                 break
@@ -353,15 +420,44 @@ class OnPolicyAlgorithm(BaseAlgorithm):
             iteration += 1
             self._update_current_progress_remaining(self.num_timesteps, total_timesteps)
 
+            # Training reward curve (mean over the most recent finished episodes)
+            if len(self.ep_info_buffer) > 0:
+                wandb.log({
+                    "train/ep_return": safe_mean([ep_info["r"] for ep_info in self.ep_info_buffer]),
+                    "train/ep_length": safe_mean([ep_info["l"] for ep_info in self.ep_info_buffer]),
+                }, step=self.num_timesteps)
+
 
             # Update policy
+            train_start = time.perf_counter()
             self.train()
+            train_time = time.perf_counter() - train_start
+
+            wandb.log({
+                "time/sim_s": self._sim_time,
+                "time/policy_inference_s": self._inference_time,
+                "time/rollout_overhead_s": rollout_time - self._sim_time - self._inference_time,
+                "time/train_s": train_time,
+                "time/steps_per_s": self.env.num_envs * self.n_steps / (rollout_time + train_time),
+            }, step=self.num_timesteps)
+
+            # Single progress line, overwritten every iteration
+            total_iterations = math.ceil(total_timesteps / (self.env.num_envs * self.n_steps))
+            percent = min(100.0, 100.0 * self.num_timesteps / total_timesteps)
+            print(f"\riter {iteration}/{total_iterations} | {self.num_timesteps:,}/{total_timesteps:,} steps "
+                  f"({percent:.0f}%) |\x1b[K", end="", flush=True)
 
             # Update running mean and standard deviation
             if iteration % 10 == 0:
                 self.env.update_rms()
 
-            # Save model and evaluate
+            # Evaluate more often than saving, for the eval curves
+            if log_interval is not None and iteration % log_interval[0] == 0:
+                eval_start = time.perf_counter()
+                self.eval(iteration)
+                wandb.log({"time/eval_s": time.perf_counter() - eval_start}, step=self.num_timesteps)
+
+            # Save model
             if log_interval is not None and iteration % log_interval[1] == 0:
                 policy_path = self.logger.get_dir() + "/Policy"
                 os.makedirs(policy_path, exist_ok=True)
@@ -370,7 +466,6 @@ class OnPolicyAlgorithm(BaseAlgorithm):
                 self.env.save_rms(
                     save_dir=self.logger.get_dir() + "/RMS", n_iter=iteration
                 )
-                self.eval(iteration)
 
                 # Save best model
                 ep_rew_mean = safe_mean([ep_info["r"] for ep_info in self.ep_info_buffer])
@@ -382,11 +477,41 @@ class OnPolicyAlgorithm(BaseAlgorithm):
                     self.env.save_rms(
                         save_dir=self.logger.get_dir() + "/RMS", n_iter=best_iter
                     )
-                    self.eval(best_iter)
 
+        print()  # leave the finished progress line on screen
         callback.on_training_end()
 
         return self
+
+    def eval(self, iteration: int, n_episodes: int = 10) -> None:
+        """Fly the eval env with the deterministic policy and log survival and rate tracking."""
+        env = self.eval_env
+        env.update_running_rms = False
+        env.set_obs_norm(*self.env.get_obs_norm())
+
+        returns, lengths, crashes, rate_rmse, bc_errors = [], [], [], [], []
+        obs = env.reset()
+        while len(returns) < n_episodes:
+            actions, _ = self.policy.predict(obs, deterministic=True)
+            obs, _, dones, infos = env.step(actions)
+            bc_errors.append(np.mean((actions - env.getQuadPrivAct()) ** 2))
+            if dones[0]:
+                returns.append(infos[0]["episode"]["r"])
+                lengths.append(infos[0]["episode"]["l"])
+                crashes.append(infos[0]["crashed"])
+                rate_rmse.append(infos[0]["rate_rmse"])
+
+        metrics = {
+            "eval/ep_return": float(np.mean(returns)),
+            "eval/ep_length": float(np.mean(lengths)),
+            "eval/crash_fraction": float(np.mean(crashes)),
+            "eval/rate_rmse": float(np.mean(rate_rmse)),
+            "eval/BC_loss": float(np.mean(bc_errors)),
+        }
+        for key, value in metrics.items():
+            self.logger.record(key, value)
+        wandb.log(metrics, step=self.num_timesteps)
+        print("\neval iter {}: {}".format(iteration, {k: round(v, 3) for k, v in metrics.items()}))  # newline: ends the progress line
 
     def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:
         """Get the parameters to save in the torch model."""

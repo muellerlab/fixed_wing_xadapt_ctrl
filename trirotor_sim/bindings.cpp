@@ -18,6 +18,7 @@
 #include "Components/Logic/PX4FixedWingAngularVelocityController.hpp"
 #include "Components/Logic/PX4FixedWingAttitudeController.hpp"
 #include "Components/Logic/QuadcopterConstants.hpp"
+#include "Components/Logic/TrirotorMixer.hpp"
 #include "Components/Offboard/CoordinatedFlightConditionSolver.hpp"
 #include "Components/Offboard/LinearAerodynamicModel.hpp"
 #include "Components/Offboard/QuadcopterController.hpp"
@@ -43,6 +44,16 @@ Eigen::Vector4d Q(Rotationd const &r) { return Eigen::Vector4d(r[0], r[1], r[2],
 Vec3f Vf(Eigen::Vector3d const &v) { return Vec3f(float(v.x()), float(v.y()), float(v.z())); }
 Eigen::Vector3d Ef(Vec3f const &v) { return Eigen::Vector3d(v.x, v.y, v.z); }
 Rotationf Qf(Eigen::Vector4d const &q) { return Rotationf(Q(q)); }
+// inverse of ServoCalibration::CmdFromNormalized
+float NormalizedFromCmd(Consts::ServoCalibration const &s, float cmd) {
+  float const offset = cmd - s.zeroCmd;
+  float const toMax = s.maxCmd - s.zeroCmd;
+  if (offset * toMax >= 0.0f) {
+    return toMax != 0.0f ? offset / toMax : 0.0f;
+  }
+  float const toMin = s.minCmd - s.zeroCmd;
+  return toMin != 0.0f ? -offset / toMin : 0.0f;
+}
 }  // namespace
 
 // float[2] struct members as read/write 2-element lists
@@ -200,6 +211,25 @@ PYBIND11_MODULE(GeneralCode, m) {
            }),
            py::arg("vehicle_id"))
       .def("copy", [](Consts const &c) { return Consts(c); })
+      // control surfaces, (aileron R, L) and (tail R, L): normalized deflection in [-1, 1] <-> raw servo cmd
+      .def("surface_cmds_from_normalized",
+           [](Consts const &c, std::array<float, 2> const &aileron, std::array<float, 2> const &tail) {
+             return py::make_tuple(
+                 std::array<float, 2>{c.ailerons[0].CmdFromNormalized(aileron[0]),
+                                      c.ailerons[1].CmdFromNormalized(aileron[1])},
+                 std::array<float, 2>{c.tailSurfaces[0].CmdFromNormalized(tail[0]),
+                                      c.tailSurfaces[1].CmdFromNormalized(tail[1])});
+           },
+           py::arg("aileron"), py::arg("tail"))
+      .def("surface_normalized_from_cmds",
+           [](Consts const &c, std::array<float, 2> const &aileron, std::array<float, 2> const &tail) {
+             return py::make_tuple(
+                 std::array<float, 2>{NormalizedFromCmd(c.ailerons[0], aileron[0]),
+                                      NormalizedFromCmd(c.ailerons[1], aileron[1])},
+                 std::array<float, 2>{NormalizedFromCmd(c.tailSurfaces[0], tail[0]),
+                                      NormalizedFromCmd(c.tailSurfaces[1], tail[1])});
+           },
+           py::arg("aileron_cmds"), py::arg("tail_cmds"))
       .def_readwrite("mass", &Consts::mass)
       .def_property("inertia_xx", ixx.first, ixx.second)
       .def_property("inertia_yy", iyy.first, iyy.second)
@@ -293,6 +323,20 @@ PYBIND11_MODULE(GeneralCode, m) {
           return msg;
         },
         py::arg("flags"), py::arg("forward_thrust"), py::arg("ang_vel"));
+  // direct actuator command (FS_TRIMOTOR_SPEEDS_CONTROL): motor speeds [rad/s] and servo values ordered
+  // (tilt R, tilt L, aileron R, aileron L, tail R, tail L). With FLAG_SPEEDS_RAW_SERVO_CMDS these are
+  // raw servo commands, otherwise angles [rad].
+  m.attr("FLAG_SPEEDS_RAW_SERVO_CMDS") = int(RadioTypes::RadioMessageDecoded::SPEEDS_FLAG_RAW_SERVO_CMDS);
+  m.def("make_speeds_command",
+        [](int flags, Eigen::Vector3d const &motorSpeeds, std::array<float, 6> const &servos) {
+          RawMessage msg;
+          float const speeds[3] = {float(motorSpeeds[0]), float(motorSpeeds[1]), float(motorSpeeds[2])};
+          uint16_t const dshot[3] = {0, 0, 0};
+          RadioTypes::RadioMessageDecoded::CreateTrimotorSpeedsCommand(uint8_t(flags), speeds, servos.data(),
+                                                                       dshot, msg.raw);
+          return msg;
+        },
+        py::arg("flags"), py::arg("motor_speeds"), py::arg("servos"));
   // attitude setpoint + total thrust [N] -> onboard PX4 attitude/rate loops (FS_TRIMOTOR_ATTITUDE_CONTROL)
   m.def("make_attitude_command",
         [](int flags, float thrust, Eigen::Vector4d const &att) {
@@ -600,4 +644,49 @@ PYBIND11_MODULE(GeneralCode, m) {
                                                      float(dt)));
            },
            py::arg("des_ang_vel"), py::arg("est_ang_vel"), py::arg("true_airspeed"), py::arg("dt"));
+
+  // ---------------------------------------------------------------- mixer
+  // The mixer TrirotorLogic runs, set up from the same constants, so an environment can turn thrust and
+  // normalized torques into the actuator commands of make_speeds_command.
+  using Mixer = Onboard::TrirotorMixer;
+  py::class_<Mixer>(m, "TrirotorMixer")
+      .def(py::init([](Consts const &c) {
+             Mixer mixer;
+             mixer.SetParameters(c.dx, c.dy1, c.dy2, c.dz, c.propellerThrustFromSpeedSqr,
+                                 c.propellerTorqueFromThrust, c.prop0SpinDir, c.maxThrustPerPropeller,
+                                 c.minThrustPerPropeller, c.maxCmdTotalThrust, c.minMotorServoAngle,
+                                 c.maxMotorServoAngle, c.tailType, c.tiltServos, c.ailerons, c.tailSurfaces,
+                                 c.aeroCoeffs, c.wingParams,
+                                 Vec3f(c.aeroRefPointToComOffset_x, c.aeroRefPointToComOffset_y,
+                                       c.aeroRefPointToComOffset_z));
+             mixer.SetAirspeedModel(c.propellerDiameter, c.propAirspeedModel);
+             return mixer;
+           }),
+           py::arg("consts"))
+      // normalized torques in [-1, 1] -> (aileron cmds (R, L), tail cmds), raw servo commands
+      .def("px4_control_surface_cmds",
+           [](Mixer const &c, Eigen::Vector3d const &normalizedTorque) {
+             std::array<float, 2> aileron, tail;
+             c.GetPX4ControlSurfaceCmds(Vf(normalizedTorque), aileron.data(), tail.data());
+             return py::make_tuple(aileron, tail);
+           },
+           py::arg("normalized_torque"))
+      .def("propeller_speeds_from_thrust",
+           [](Mixer const &c, Eigen::Vector3d const &thrusts, Eigen::Vector3d const &motorAngles,
+              Eigen::Vector3d const &airspeedBody) {
+             float const t[3] = {float(thrusts[0]), float(thrusts[1]), float(thrusts[2])};
+             float const a[3] = {float(motorAngles[0]), float(motorAngles[1]), float(motorAngles[2])};
+             float speeds[3];
+             c.PropellerSpeedsFromThrust(t, speeds, a, Vf(airspeedBody));
+             return Eigen::Vector3d(speeds[0], speeds[1], speeds[2]);
+           },
+           py::arg("thrusts"), py::arg("motor_angles"), py::arg("airspeed_b"))
+      .def("motor_servo_cmds_from_angles",
+           [](Mixer const &c, Eigen::Vector3d const &angles) {
+             float const a[3] = {float(angles[0]), float(angles[1]), float(angles[2])};
+             float cmds[3];
+             c.MotorServoCmdsFromAngles(a, cmds);
+             return Eigen::Vector3d(cmds[0], cmds[1], cmds[2]);
+           },
+           py::arg("angles"));
 }

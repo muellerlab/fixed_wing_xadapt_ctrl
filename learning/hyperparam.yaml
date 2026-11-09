@@ -2,15 +2,28 @@ simulation:
   seed: 1
   sim_dt: 0.002
   max_t: 5.0
-  num_envs: 300
+  warmup_t: 0.5 # held on trim before release, while the actuators settle (s)
+  num_envs: 4
   num_threads: 10
-  com_latency: 5.0e-3 # simulated communication latency (s)
+  com_latency: 5.0e-3 # simulated communication latency, policy to actuators (s)
+  offboard_dt: 0.01 # offboard guidance period (s)
+  offboard_latency: 0.03 # offboard guidance to vehicle latency (s)
+
+randomization: # uniform, +/- fraction of nominal, resampled every episode
+  enabled: true
+  mass: 0.15
+  inertia_xx: 0.20
+  inertia_yy: 0.20
+  inertia_zz: 0.20
+  propellerThrustFromSpeedSqr: 0.15
+  propellerTorqueFromThrust: 0.15
+  motorTimeConst: 0.30
 
 observation_space:
   history_len: 100
-  state_obs_size: 8
-  act_size: 4
-  env_obs_size: 34
+  state_obs_size: 10
+  act_size: 6 # motor R, motor L, aileron R, aileron L, tail R, tail L
+  env_obs_size: 7 # physical parameters given to the teacher
   latent_size: 8
 
 rewards:
