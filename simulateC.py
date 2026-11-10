@@ -8,9 +8,17 @@ trim state, and the results are overlaid.
                        (onboard PX4 attitude + rate controllers -> surfaces, motors fixed forward)
       rates / TECS     .run_tecs                                    -> trirotorForwardWingCmd
       px4 / TECS       .run_tecs_attitude_setpoint                  -> trirotorAttitudeCmd
+
+      hover is inherited from the xadapt repo but not used for fixed wing now    
   --mode hover              level hover
       trirotor         TrirotorController   -> trirotorTiltrotorCmd (onboard tiltrotor rate ctrl + mixer)
       quad             QuadcopterController -> externalRatesCmd     (onboard external-rates mode)
+
+  --policy learning/saved/PPO_<n>/Policy/iter_<i>.pth [--policy-stacks px4-tecs ... | all]  = deploy trained policy 
+      policy / <stack> ; port policy into control stack functionality to replace that cooresponding rate controller + mixer
+
+  --variants ;
+      can be used to graph specific controller variants for a simulation      
 """
 from __future__ import print_function, division
 
@@ -38,8 +46,29 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--mode", choices=["forward", "hover"], default="forward",
                     help="flight mode whose controller variants are compared (default: forward)")
 parser.add_argument("--no-animate", action="store_true", help="skip the 3D animation (hover mode)")
+POLICY_STACKS = collections.OrderedDict([  # name -> (onboard, guidance, label)
+    ("rates-solver", ("rates", "solver", "rates / solver")),
+    ("px4-solver", ("px4", "solver", "px4 / solver")),
+    ("rates-tecs", ("rates", "tecs", "rates / TECS")),
+    ("px4-tecs", ("px4", "tecs", "px4 / TECS")),
+])
+parser.add_argument("--policy", help="trained policy (learning/saved/PPO_<n>/Policy/iter_<i>.pth) to fly in place of "
+                                     "the onboard rate controller + mixer (forward mode)")
+parser.add_argument("--policy-stacks", nargs="+", choices=list(POLICY_STACKS) + ["all"], default=["px4-tecs"],
+                    help="offboard stacks to fly the policy under (default px4-tecs, the one it was trained under)")
+parser.add_argument("--variants", nargs="+", choices=list(POLICY_STACKS) + ["all", "none"], default=["all"],
+                    help="stock forward-mode variants to fly (default all; none = only the policy variants)")
 args = parser.parse_args()
 forward = args.mode == "forward"
+if args.policy and not forward:
+    parser.error("--policy is for forward flight only")
+if "all" in args.policy_stacks:
+    args.policy_stacks = list(POLICY_STACKS)
+if not forward and args.variants != ["all"]:
+    parser.error("--variants is for forward flight only")
+args.variants = list(POLICY_STACKS) if "all" in args.variants else [v for v in args.variants if v != "none"]
+if forward and not args.variants and not args.policy:
+    parser.error("--variants none leaves nothing to fly without --policy")
 
 np.random.seed(5)
 
@@ -146,10 +175,93 @@ def hold_reference(pos):
     return pos0, velTrim, np.zeros(3)
 
 
+class TrainedPolicy:
+    """A trained policy (learning/) in place of the onboard rate controller and mixer, built like
+    learning/env/init_trirotor_env.py: commanded body rates -> policy -> trirotorSpeedsCmd, every step."""
+
+    def __init__(self, path):
+        import torch
+        from ruamel.yaml import YAML
+        from stable_baselines3.ppo.policies import MlpPolicy
+        from learning.env import init_trirotor_env as env
+        self.env = env
+
+        saved = torch.load(path, map_location="cpu", weights_only=False)
+        self.policy = MlpPolicy(**saved["data"])
+        self.policy.action_net = torch.nn.Sequential(self.policy.action_net, torch.nn.Tanh())
+        self.policy.load_state_dict(saved["state_dict"])
+        self.policy.eval()
+
+        run_dir = os.path.dirname(os.path.dirname(os.path.abspath(path)))  # learning/saved/PPO_<n>
+        rms = np.load(os.path.join(run_dir, "RMS", os.path.splitext(os.path.basename(path))[0] + ".npz"))
+        self.obs_mean, self.obs_std = rms["mean"], np.sqrt(rms["var"] + 1e-8)
+        cfg = YAML(typ="safe").load(open(os.path.join(run_dir, "config.yaml")))
+        sim, space = cfg["simulation"], cfg["observation_space"]
+        if abs(float(sim["sim_dt"]) - dt) > 1e-9:
+            raise ValueError("policy trained at sim_dt {}, simulateC runs at dt {}".format(sim["sim_dt"], dt))
+        if space["act_size"] != env.ACTION_SIZE:
+            raise ValueError("policy has {} outputs; this needs a {}-actuator policy (motors + surfaces)".format(
+                space["act_size"], env.ACTION_SIZE))
+        obs_size = space["state_obs_size"] + space["act_size"] + space["env_obs_size"]
+        if obs_size != self.policy.observation_space.shape[0]:
+            raise ValueError("config.yaml observation size {} does not match the policy's {}".format(
+                obs_size, self.policy.observation_space.shape[0]))
+        self.com_delay = int(round(float(sim["com_latency"]) / dt))
+        self.parameters = np.zeros(space["env_obs_size"])  # simulateC flies the nominal vehicle
+
+        self.att_ctrl = GeneralCode.PX4FixedWingAttitudeController()
+        self.tilt_cmds = GeneralCode.TrirotorMixer(consts).motor_servo_cmds_from_angles(env.MOTOR_ANGLES)
+        self.mode = "attitude"
+        self.cmd_att, self.cmd_thrust = self._limit(attTrim), float(trim.T)
+        self.cmd_ang_vel = np.zeros(3)
+        self.prev_vel = velTrim.copy()
+        self.last_action = np.zeros(space["act_size"])
+        self.queue = collections.deque()
+
+    def _limit(self, att):
+        """Same pitch/roll limits the onboard attitude-setpoint mode applies."""
+        yaw, pitch, roll = self.env.ypr_from_quat(att)
+        return self.env.quat_from_ypr(yaw, np.clip(pitch, -consts.stabilizeMaxPitch, consts.stabilizeMaxPitch),
+                                      np.clip(roll, -consts.stabilizeMaxRoll, consts.stabilizeMaxRoll))
+
+    def deliver(self, payload):
+        """Offboard ("attitude", att, thrust) or ("rates", ang_vel, thrust), after the radio delay."""
+        self.mode, value, thrust = payload
+        self.cmd_thrust = float(thrust)
+        if self.mode == "attitude":
+            self.cmd_att = self._limit(value)
+        else:
+            self.cmd_ang_vel = np.array(value, dtype=float)
+
+    def step(self, tri):
+        """One onboard step: observation (training order) -> action -> trirotorSpeedsCmd. Returns the commanded rates."""
+        env = self.env
+        att, vel, ang_vel = tri.attitude(), tri.velocity(), tri.angular_velocity()
+        airspeed_b = env.rotate_to_body(att, vel)
+        airspeed = float(np.linalg.norm(airspeed_b))
+        alpha = np.arctan2(-airspeed_b[2], airspeed_b[0])
+        proper_acc_x = env.rotate_to_body(att, (vel - self.prev_vel) / dt + env.PROPER_ACC_LEVEL)[0]
+        self.prev_vel = vel
+        if self.mode == "attitude":
+            self.cmd_ang_vel = self.att_ctrl.desired_angular_velocity(self.cmd_att, att, airspeed, 0.0)
+
+        raw = np.concatenate(([ang_vel[0], ang_vel[1], ang_vel[2], proper_acc_x, self.cmd_ang_vel[0],
+                               self.cmd_ang_vel[1], self.cmd_ang_vel[2], self.cmd_thrust, airspeed, alpha],
+                              self.last_action, self.parameters))
+        obs = np.clip((raw - self.obs_mean) / self.obs_std, -10.0, 10.0).astype(np.float32)
+        action, _ = self.policy.predict(obs, deterministic=True)
+        self.last_action = np.asarray(action, dtype=float)
+
+        self.queue.append(env.actuator_message(consts, self.tilt_cmds, self.last_action))
+        if len(self.queue) > self.com_delay:
+            tri.set_command_radio_msg(self.queue.popleft())
+        return self.cmd_ang_vel
+
+
 #==============================================================================
 # Controller variants: each returns a function trirotor -> (cmd_ang_vel, radio message)
 #==============================================================================
-def forward_controller(onboard, guidance):
+def forward_controller(onboard, guidance, policy=None):
     fw = consts.fixedWingControlConsts
     tc = consts.tecsControlConsts
     lg = consts.lateralGuidanceConsts
@@ -169,16 +281,27 @@ def forward_controller(onboard, guidance):
     period = offboardPeriod_us * 1e-6
     lastGood = [attTrim, trim.T]  # attitude setpoint held if the solver goes degenerate
 
+    # with a trained policy onboard, the offboard output goes to it as a plain payload instead of a radio command
+    def attitude_message(thrust, desAtt):
+        if policy is not None:
+            return ("attitude", desAtt, thrust)
+        return GeneralCode.make_attitude_command(cmdFlags, thrust, desAtt)
+
+    def rates_message(thrust, angVel):
+        if policy is not None:
+            return ("rates", angVel, thrust)
+        return GeneralCode.make_forward_wing_command(cmdFlags, thrust, angVel)
+
     def command(tri):
         pos, vel, att = tri.position(), tri.velocity(), tri.attitude()
         desPos, desVel, desAcc = hold_reference(pos)
         if guidance == "tecs" and onboard == "px4":
             desAtt, thrust = ctrl.run_tecs_attitude_setpoint(pos, vel, att, desPos, desVel, desAcc,
                                                              groundWind, period)
-            return np.zeros(3), GeneralCode.make_attitude_command(cmdFlags, thrust, desAtt)
+            return np.zeros(3), attitude_message(thrust, desAtt)
         if guidance == "tecs":
             angVel, thrust = ctrl.run_tecs(pos, vel, att, desPos, desVel, desAcc, groundWind, period)
-            return angVel, GeneralCode.make_forward_wing_command(cmdFlags, thrust, angVel)
+            return angVel, rates_message(thrust, angVel)
         if onboard == "px4":
             # like the lab's TrirotorLoiterFlightControl node: hold the last good setpoint if the solver
             # is degenerate, fly the best effort if it can't bracket a solution
@@ -188,10 +311,13 @@ def forward_controller(onboard, guidance):
                 desAtt, thrust = lastGood
             else:
                 lastGood[:] = [desAtt, thrust]
-            return np.zeros(3), GeneralCode.make_attitude_command(cmdFlags, thrust, desAtt)
+            return np.zeros(3), attitude_message(thrust, desAtt)
         angVel, thrust = ctrl.run(pos, vel, att, desPos, desVel, desAcc, groundWind, period)
-        return angVel, GeneralCode.make_forward_wing_command(cmdFlags, thrust, angVel)
+        return angVel, rates_message(thrust, angVel)
 
+    if policy is not None:
+        command.deliver = policy.deliver
+        command.onboard = policy.step
     return command
 
 
@@ -234,6 +360,13 @@ if forward:
         ("rates / TECS", lambda: forward_controller("rates", "tecs")),
         ("px4 / TECS", lambda: forward_controller("px4", "tecs")),
     ])
+    selected = [POLICY_STACKS[v][2] for v in args.variants]  # --variants, same names as --policy-stacks
+    variants = collections.OrderedDict((name, make) for name, make in variants.items() if name in selected)
+    if args.policy:
+        for stack in args.policy_stacks:
+            onboard, guidance, label = POLICY_STACKS[stack]
+            variants["policy / " + label] = (
+                lambda o=onboard, g=guidance: forward_controller(o, g, TrainedPolicy(args.policy)))
 else:
     variants = collections.OrderedDict([
         ("trirotor", hover_trirotor_controller),
@@ -259,6 +392,7 @@ def set_state(tri, pos, vel, att, angVel):
 def run_variant(make_command):
     timer, tri = make_vehicle()
     command = make_command()
+    deliver = getattr(command, "deliver", tri.set_command_radio_msg)  # a trained policy takes its own delivery
     numSteps = int(endTime / dt)
     h = {k: np.zeros([numSteps, n]) for k, n in [
         ("time", 1), ("pos", 3), ("posErr", 3), ("vel", 3), ("att", 3), ("angVel", 3),
@@ -298,7 +432,11 @@ def run_variant(make_command):
 
         # deliver commands whose radio delay has elapsed
         while radioQueue and radioQueue[0][0] <= t_us:
-            tri.set_command_radio_msg(radioQueue.popleft()[1])
+            deliver(radioQueue.popleft()[1])
+
+        # a trained policy in place of the onboard rate controller + mixer runs every step
+        if hasattr(command, "onboard"):
+            cmdAngVel = command.onboard(tri)
 
         if not released or t_rel <= 0:
             continue  # warm-up is not logged
@@ -392,6 +530,7 @@ print("Saved {}".format(data_path))
 #==============================================================================
 # Animate the first variant (hover only: the animation's fixed +/-2 m view can't follow forward
 # flight)
+#TODO: add a forward-flight animation moving air frame, so the vehicle is fixed in teh middle and the axis and reference line move
 #==============================================================================
 if forward and not args.no_animate:
     print("Animation skipped in forward mode (fixed +/-2 m view).")

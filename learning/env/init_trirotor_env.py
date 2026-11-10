@@ -100,6 +100,17 @@ def ypr_from_quat(q):
             math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y)))
 
 
+def actuator_message(nominal, tilt_cmds, action):
+    """Policy action [motor R, motor L, aileron R, aileron L, tail R, tail L] in [-1, 1] -> trirotorSpeedsCmd.
+    Also used by simulateC.py to fly a trained policy."""
+    speeds = np.array([0.5 * (float(action[0]) + 1.0) * MOTOR_SPEED_LIMIT,
+                       0.5 * (float(action[1]) + 1.0) * MOTOR_SPEED_LIMIT, 0.0])
+    aileron, tail = nominal.surface_cmds_from_normalized([float(action[2]), float(action[3])],
+                                                         [float(action[4]), float(action[5])])
+    servos = [float(tilt_cmds[0]), float(tilt_cmds[1]), aileron[0], aileron[1], tail[0], tail[1]]
+    return GC.make_speeds_command(COMMAND_FLAGS, speeds, servos)
+
+
 def rotate_to_body(q, v):
     """Inertial vector -> body frame."""
     w, x, y, z = q
@@ -259,12 +270,7 @@ class _Vehicle:
                                       aileron[0], aileron[1], tail[0], tail[1]], -1.0, 1.0)
 
     def _command_message(self, action):
-        speeds = np.array([0.5 * (float(action[0]) + 1.0) * MOTOR_SPEED_LIMIT,
-                           0.5 * (float(action[1]) + 1.0) * MOTOR_SPEED_LIMIT, 0.0])
-        aileron, tail = self.nominal.surface_cmds_from_normalized([float(action[2]), float(action[3])],
-                                                                  [float(action[4]), float(action[5])])
-        servos = [float(self.tilt_cmds[0]), float(self.tilt_cmds[1]), aileron[0], aileron[1], tail[0], tail[1]]
-        return GC.make_speeds_command(COMMAND_FLAGS, speeds, servos)
+        return actuator_message(self.nominal, self.tilt_cmds, action)
 
     def _apply_action(self, action):
         message = self._command_message(action)
