@@ -42,10 +42,14 @@ try:
 except ImportError as e:
     sys.exit("Could not import the compiled GeneralCode module ({}). Run `make sim` first.".format(e))
 
+#==============================================================================
+#CLI FLAGS
+#=============================================================================
 parser = argparse.ArgumentParser()
 parser.add_argument("--mode", choices=["forward", "hover"], default="forward",
                     help="flight mode whose controller variants are compared (default: forward)")
-parser.add_argument("--no-animate", action="store_true", help="skip the 3D animation (hover mode)")
+parser.add_argument("--no-animate", action="store_true",
+                    help="skip the 3D animation (hover mode, or forward mode with --policy and --variants none)")
 POLICY_STACKS = collections.OrderedDict([  # name -> (onboard, guidance, label)
     ("rates-solver", ("rates", "solver", "rates / solver")),
     ("px4-solver", ("px4", "solver", "px4 / solver")),
@@ -153,7 +157,7 @@ else:
     attTrim = np.array([1.0, 0.0, 0.0, 0.0])  # level, yaw 0
 
 yprTrim = ypr_from_quat(attTrim)
-yprInit = yprTrim + np.radians(np.random.uniform(-10, 10, 3))
+yprInit = yprTrim + np.radians(np.random.uniform(-30, 30, 3))
 attInit = quat_from_ypr(yprInit)
 print("Initial yaw/pitch/roll {} deg (trim {} deg)".format(np.round(np.degrees(yprInit), 2),
                                                           np.round(np.degrees(yprTrim), 2)))
@@ -528,18 +532,17 @@ pd.concat(frames).to_csv(data_path, index=False)
 print("Saved {}".format(data_path))
 
 #==============================================================================
-# Animate the first variant (hover only: the animation's fixed +/-2 m view can't follow forward
-# flight)
-#TODO: add a forward-flight animation moving air frame, so the vehicle is fixed in teh middle and the axis and reference line move
+# Animate the first variant.
+#   hover:   fixed +/-2 m world view
+#   forward: view moving with the vehicle (vehicle centred, axes and reference line scroll), only when a
+#            policy is flown on its own (--policy ... --variants none)
 #==============================================================================
-if forward and not args.no_animate:
-    print("Animation skipped in forward mode (fixed +/-2 m view).")
-elif not args.no_animate:
+def animation_history(name):
+    """(times, positions 3xN, attitudes 3x3xN) of one variant, from the saved CSV."""
     from pyplot3d.utils import ypr_to_R
-    from animate import animate_quadcopter_history
 
     data = pd.read_csv(data_path)
-    data = data[data['Variant'] == next(iter(results))]
+    data = data[data['Variant'] == name]
     times = data['Time'].values
     posHistory = data[['PosX', 'PosY', 'PosZ']].values
     attHistory = data[['Yaw', 'Pitch', 'Roll']].values
@@ -549,5 +552,23 @@ elif not args.no_animate:
     Rm = np.zeros((3, 3, steps))
     for i in range(steps):
         Rm[:, :, i] = ypr_to_R(attHistory[i, :], degrees=False)
+    return times, x, Rm
 
+
+if args.no_animate:
+    pass
+elif forward:
+    if args.policy and not args.variants:
+        from animate import animate_forward_flight_history
+
+        name = next(iter(results))
+        times, x, Rm = animation_history(name)
+        animate_forward_flight_history(times, x, Rm, ref_point=pos0, ref_dir=velTrim,
+                                       speeds=np.linalg.norm(results[name]["vel"], axis=1))
+    else:
+        print("Forward animation skipped: it runs for a policy on its own (--policy ... --variants none).")
+else:
+    from animate import animate_quadcopter_history
+
+    times, x, Rm = animation_history(next(iter(results)))
     animate_quadcopter_history(times, x, Rm, arm_length=0.4)
