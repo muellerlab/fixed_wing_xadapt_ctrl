@@ -60,14 +60,16 @@ def animate_quadcopter_history(times, x, R,arm_length=0.3,tilt_angle=0.0):
     plt.show()
 
 def animate_forward_flight_history(times, x, R, ref_point, ref_dir, speeds=None, arm_length=0.4,
-                                   window=(2.0, 1.5), trail_time=1.0,
-                                   gif_filename="forward_flight_animation.gif"):
+                                   window=(4.0, 3.0), trail_time=1.0,
+                                   gif_filename="forward_flight_animation.gif", reference=None):
     """Forward-flight animation in a frame that moves with the vehicle: the view stays centred on it, so the
     axes and the reference line scroll past while the vehicle shows its attitude.
 
     x: 3xN positions, R: 3x3xN attitudes, ref_point/ref_dir: the straight reference line (point, direction),
     speeds: optional N airspeeds for the title, window: (horizontal, vertical) half-widths of the view [m],
     trail_time: [s] of past path drawn as a thin red line (clipped to the view).
+    reference: optional callable t -> (point, direction) for a reference line that changes over time; used in
+    place of ref_point/ref_dir when given.
     The quadcopter model is a placeholder airframe for now."""
     plt.style.use('ggplot')
 
@@ -87,8 +89,11 @@ def animate_forward_flight_history(times, x, R, ref_point, ref_dir, speeds=None,
         uav_plot.draw_at(centre, R[:, :, i])  # clears the axis, so everything else is drawn after it
 
         # reference line across the view: the part of the line next to the vehicle
-        s = np.dot(centre - ref_point, ref_dir)
-        line = ref_point[:, None] + ref_dir[:, None] * np.array([s - half_h, s + half_h])
+        point, direction = (ref_point, ref_dir) if reference is None else reference(times[i])
+        point = np.asarray(point, dtype=float)
+        direction = np.asarray(direction, dtype=float) / np.linalg.norm(direction)
+        s = np.dot(centre - point, direction)
+        line = point[:, None] + direction[:, None] * np.array([s - half_h, s + half_h])
         ax.plot(line[0], line[1], line[2], '--', color='k', lw=1)
 
         # trail: recent path, only the part inside the view (3D axes don't clip)

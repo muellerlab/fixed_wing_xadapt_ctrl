@@ -18,7 +18,10 @@ trim state, and the results are overlaid.
       policy / <stack> ; port policy into control stack functionality to replace that cooresponding rate controller + mixer
 
   --variants ;
-      can be used to graph specific controller variants for a simulation      
+      can be used to graph specific controller variants for a simulation
+
+  --velocity-change T VX VY VZ ;
+      at T s after release, track a new straight line at velocity V, starting from the planned switch point
 """
 from __future__ import print_function, division
 
@@ -62,6 +65,9 @@ parser.add_argument("--policy-stacks", nargs="+", choices=list(POLICY_STACKS) + 
                     help="offboard stacks to fly the policy under (default px4-tecs, the one it was trained under)")
 parser.add_argument("--variants", nargs="+", choices=list(POLICY_STACKS) + ["all", "none"], default=["all"],
                     help="stock forward-mode variants to fly (default all; none = only the policy variants)")
+parser.add_argument("--velocity-change", nargs=4, type=float, metavar=("T", "VX", "VY", "VZ"),
+                    help="at T s after release, switch the forward-flight reference to velocity (VX, VY, VZ) [m/s], "
+                         "a new straight line from the planned switch point")
 args = parser.parse_args()
 forward = args.mode == "forward"
 if args.policy and not forward:
@@ -92,6 +98,11 @@ def ypr_from_quat(q):
 #==============================================================================
 dt = 0.002
 endTime = 10 if forward else 5  # [s] logged time after release
+if args.velocity_change is not None:
+    if not forward:
+        parser.error("--velocity-change is for forward flight only")
+    if not 0 < args.velocity_change[0] < endTime or np.linalg.norm(args.velocity_change[1:]) == 0:
+        parser.error("--velocity-change needs 0 < T < {} s and a non-zero velocity".format(endTime))
 
 dt_us = int(round(dt * 1e6))
 offboardPeriod_us = 10000  # offboard controller at 100 Hz (mainLoopFrequency in the ROS loiter node)
@@ -163,19 +174,31 @@ print("Initial yaw/pitch/roll {} deg (trim {} deg)".format(np.round(np.degrees(y
                                                           np.round(np.degrees(yprTrim), 2)))
 
 
+def reference_segment(t_rel):
+    """(start point, start time, velocity) of the straight reference segment active at t_rel (time since
+    release): the trim line from pos0, then, with --velocity-change T V, a new line from the planned switch
+    point pos0 + velTrim * T at velocity V (the same for every variant, so they stay comparable)."""
+    if args.velocity_change is None or t_rel < args.velocity_change[0]:
+        return pos0, 0.0, velTrim
+    tSwitch = args.velocity_change[0]
+    return pos0 + velTrim * tSwitch, tSwitch, np.array(args.velocity_change[1:])
+
+
 def trim_position(t_rel):
-    """Where the vehicle would be if it stayed exactly on the trim state (t_rel = time since release)."""
-    return pos0 + velTrim * t_rel
+    """Where the vehicle would be if it flew the reference exactly (t_rel = time since release)."""
+    start, tStart, vel = reference_segment(t_rel)
+    return start + vel * (t_rel - tStart)
 
 
-def hold_reference(pos):
-    """Reference holding the trim condition. Forward flight is path following along the straight
-    trim line, the zero-curvature case of GeneralCode's LoiterTrajectory::GetReference: the reference
+def hold_reference(pos, t_rel):
+    """Reference holding the trim condition. Forward flight is path following along the current straight
+    segment, the zero-curvature case of GeneralCode's LoiterTrajectory::GetReference: the reference
     is the point on the line closest to the vehicle (so no along-track error, only cross-track and
-    height error), moving at the trim velocity. Hover keeps the start point."""
+    height error), moving at the segment velocity. Hover keeps the start point."""
     if forward:
-        trackDir = velTrim / np.linalg.norm(velTrim)
-        return pos0 + np.dot(pos - pos0, trackDir) * trackDir, velTrim, np.zeros(3)
+        start, _, vel = reference_segment(t_rel)
+        trackDir = vel / np.linalg.norm(vel)
+        return start + np.dot(pos - start, trackDir) * trackDir, vel, np.zeros(3)
     return pos0, velTrim, np.zeros(3)
 
 
@@ -296,9 +319,9 @@ def forward_controller(onboard, guidance, policy=None):
             return ("rates", angVel, thrust)
         return GeneralCode.make_forward_wing_command(cmdFlags, thrust, angVel)
 
-    def command(tri):
+    def command(tri, t_rel):
         pos, vel, att = tri.position(), tri.velocity(), tri.attitude()
-        desPos, desVel, desAcc = hold_reference(pos)
+        desPos, desVel, desAcc = hold_reference(pos, t_rel)
         if guidance == "tecs" and onboard == "px4":
             desAtt, thrust = ctrl.run_tecs_attitude_setpoint(pos, vel, att, desPos, desVel, desAcc,
                                                              groundWind, period)
@@ -333,8 +356,8 @@ def hover_trirotor_controller():
                         consts.attControl_integralLimit_x, consts.attControl_integralLimit_y,
                         consts.attControl_integralLimit_z)
 
-    def command(tri):
-        desPos, desVel, desAcc = hold_reference(tri.position())
+    def command(tri, t_rel):
+        desPos, desVel, desAcc = hold_reference(tri.position(), t_rel)
         angVel, verticalThrust, forwardThrust = ctrl.run(
             tri.position(), tri.velocity(), tri.attitude(), desPos, desVel, desAcc, 0.0, yprTrim[0],
             offboardPeriod_us * 1e-6)
@@ -348,8 +371,8 @@ def hover_quad_controller():
     ctrl.set_parameters(consts.posControl_natFreq, consts.posControl_damping,
                         consts.attControl_timeConst_xy, consts.attControl_timeConst_z)
 
-    def command(tri):
-        desPos, desVel, desAcc = hold_reference(tri.position())
+    def command(tri, t_rel):
+        desPos, desVel, desAcc = hold_reference(tri.position(), t_rel)
         angVel, thrust = ctrl.run(tri.position(), tri.velocity(), tri.attitude(),
                                   desPos, desVel, desAcc, yprTrim[0])
         return angVel, GeneralCode.make_rates_command(cmdFlags, thrust, angVel)
@@ -431,7 +454,7 @@ def run_variant(make_command):
             tri.set_kf_position(tri.position())
             tri.set_kf_velocity(tri.velocity())
             tri.set_kf_attitude(tri.attitude())
-            cmdAngVel, msg = command(tri)
+            cmdAngVel, msg = command(tri, t_rel)
             radioQueue.append((t_us + radioDelay_us, msg))
 
         # deliver commands whose radio delay has elapsed
@@ -491,6 +514,13 @@ panels = [  # (column, row, label, function of history)
 ]
 trimLines = {(0, 3): np.linalg.norm(velTrim), (0, 4): yprTrim[2] * deg,
              (0, 5): yprTrim[1] * deg, (0, 6): yprTrim[0] * deg}
+# with --velocity-change, speed and heading reference over time instead of the constant trim lines
+refLines = {}
+if args.velocity_change is not None:
+    tRef = next(iter(results.values()))["time"].flatten()
+    velRef = np.array([reference_segment(t)[2] for t in tRef])
+    refLines = {(0, 3): np.linalg.norm(velRef, axis=1),
+                (0, 6): yprTrim[0] * deg + np.degrees(np.arctan2(velRef[:, 1], velRef[:, 0]))}
 
 fig, ax = plt.subplots(7, 2, sharex=True, figsize=(13, 14))
 fig.suptitle("simulateC: {} mode, controller variants".format(args.mode))
@@ -498,7 +528,9 @@ for col, row, label, f in panels:
     a = ax[row, col]
     for i, (name, h) in enumerate(results.items()):
         a.plot(h["time"], f(h), color='C{}'.format(i), label=name, lw=1)
-    if (col, row) in trimLines:
+    if (col, row) in refLines:
+        a.plot(tRef, refLines[(col, row)], ls='--', color='k', lw=0.8)
+    elif (col, row) in trimLines:
         a.axhline(trimLines[(col, row)], ls='--', color='k', lw=0.8)
     a.set_ylabel(label)
 ax[0, 0].legend(loc='upper right', fontsize=7)
@@ -564,6 +596,7 @@ elif forward:
         name = next(iter(results))
         times, x, Rm = animation_history(name)
         animate_forward_flight_history(times, x, Rm, ref_point=pos0, ref_dir=velTrim,
+                                       reference=lambda t: reference_segment(t)[0::2],
                                        speeds=np.linalg.norm(results[name]["vel"], axis=1))
     else:
         print("Forward animation skipped: it runs for a policy on its own (--policy ... --variants none).")
