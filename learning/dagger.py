@@ -1,666 +1,287 @@
+"""Phase 2: DAgger for the history student.
+
+The Phase 1 policy is frozen. Its trunk (mlp_extractor.shared_net) maps the 23-dim observation, which
+includes the privileged physical parameters e, to an 8-dim latent z. The student sees the current
+[x_t, a_{t-1}] and the history before it, never e, and is trained to output the same z:
+
+    teacher: z  = shared_net(x_t, a_{t-1}, e)
+    student: ẑ  = student(x_t, a_{t-1}, history)
+    action      = action_net(policy_net(ẑ))      frozen Phase 1 head
+
+On-policy DAgger: the student flies from the first iteration, the teacher labels every visited state
+with z, and the data is used for one round of updates (no aggregation across iterations).
+"""
+
+import math
 import os
 import time
-from collections import defaultdict
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+from collections import deque
 
-import gym
-import matplotlib.gridspec as gridspec
-import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import torch as th
 import torch.nn as nn
-import torch.optim as optim
-from gym import spaces
-from mpl_toolkits.mplot3d import Axes3D
+import torch.nn.functional as F
+import wandb
 from ruamel.yaml import YAML
-from stable_baselines3.common.base_class import BaseAlgorithm
-from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.policies import ActorCriticPolicy
-from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import safe_mean
-from stable_baselines3.common.vec_env import VecEnv
 
 
-class PhaseTwoAlgorithm(BaseAlgorithm):
+class FrozenHead(nn.Module):
+    """Phase 1 policy_net + action_net (with its Tanh): 8-dim latent -> deterministic action in [-1, 1]."""
+
+    def __init__(self, teacher):
+        super(FrozenHead, self).__init__()
+        self.policy_net = teacher.mlp_extractor.policy_net
+        self.action_net = teacher.action_net
+
+    def forward(self, z):
+        return th.clamp(self.action_net(self.policy_net(z)), -1.0, 1.0)
+
+
+class DeployPolicy(nn.Module):
+    """Student + frozen head: normalised student input -> action. This is what gets flown after training."""
+
+    def __init__(self, student, head):
+        super(DeployPolicy, self).__init__()
+        self.student = student
+        self.head = head
+
+    def forward(self, x):
+        return self.head(self.student(x))
+
+
+def next_run_dir(root, prefix="Student"):
+    """root/<prefix>_<n> with the next free n, numbered like SB3 numbers PPO_<n>."""
+    os.makedirs(root, exist_ok=True)
+    taken = [int(d.split("_")[-1]) for d in os.listdir(root)
+             if d.startswith(prefix + "_") and d.split("_")[-1].isdigit()]
+    return os.path.join(root, "{}_{}".format(prefix, max(taken, default=0) + 1))
+
+
+class DAGGER:
     """
-    Base class for Phase Two algorithms (e.g., DAGGER).
-    
-    This class implements the core functionality for Phase Two algorithms including:
-    - Experience collection with extrinsic information
-    - Environment latent encoder training
-    - Policy updates
-    - Environment interaction
-    - Logging and evaluation
-
     Parameters
     ----------
-    env_latent_encoder : nn.Module
-        Neural network for encoding environment latent information
-    policy : Union[str, Type[ActorCriticPolicy]]
-        The policy model to use
-    env : Union[GymEnv, str]
-        The environment to learn from
-    learning_rate : Union[float, Schedule]
-        The learning rate
-    n_steps : int
-        The number of steps to run for each environment per update
-    use_tanh_act : bool
-        Whether to use tanh activation for actions
-    gamma : float
-        Discount factor
-    gae_lambda : float
-        Factor for trade-off of bias vs variance for GAE
-    ent_coef : float
-        Entropy coefficient for the loss calculation
-    vf_coef : float
-        Value function coefficient for the loss calculation
-    max_grad_norm : float
-        The maximum value for the gradient clipping
-    use_sde : bool
-        Whether to use State Dependent Exploration
-    sde_sample_freq : int
-        Sample a new noise matrix every n steps when using gSDE
-    history_len : int
-        Length of history to use for latent encoding
-    state_obs_size : int
-        Size of state observations
-    env_obs_size : int
-        Size of environment observations
-    latent_size : int
-        Size of latent space
-    act_size : int
-        Size of action space
-    tensorboard_log : Optional[str]
-        The log location for tensorboard
-    create_eval_env : bool
-        Whether to create a second environment for evaluation
-    eval_env : Union[GymEnv, str]
-        The environment used for evaluation
-    monitor_wrapper : bool
-        Whether to wrap the environment in a Monitor wrapper
-    policy_kwargs : Optional[Dict[str, Any]]
-        Additional arguments to be passed to the policy on creation
-    verbose : int
-        The verbosity level: 0 no output, 1 info, 2 debug
-    seed : Optional[int]
-        Seed for the pseudo random generators
-    device : Union[th.device, str]
-        Device (cpu, cuda, ...) on which the code should be run
-    _init_setup_model : bool
-        Whether or not to build the network at the creation of the instance
-    supported_action_spaces : Optional[Tuple[gym.spaces.Space, ...]]
-        The action spaces supported by the algorithm
+    teacher : ActorCriticPolicy
+        Phase 1 policy, loaded with its Tanh-wrapped action_net. Frozen here.
+    student : nn.Module
+        Maps the student input ([x_t, a_{t-1}] + history) to the 8-dim latent.
+    env, eval_env : TrirotorEnv
+        Built with with_history=True, with the Phase 1 RMS loaded and update_running_rms = False.
+    cfg : dict
+        hyperparam.yaml; the "dagger" section holds the Phase 2 settings.
+    log_dir : str
+        This run's folder (train.py passes saved/Student_<n>).
     """
 
-    def __init__(
-        self,
-        env_latent_encoder: nn.Module,
-        policy: Union[str, Type[ActorCriticPolicy]],
-        env: Union[GymEnv, str],
-        learning_rate: Union[float, Schedule],
-        n_steps: int,
-        use_tanh_act: bool,
-        gamma: float,
-        gae_lambda: float,
-        ent_coef: float,
-        vf_coef: float,
-        max_grad_norm: float,
-        use_sde: bool,
-        sde_sample_freq: int,
-        history_len: int,
-        state_obs_size: int,
-        env_obs_size: int,
-        latent_size: int,
-        act_size: int,
-        tensorboard_log: Optional[str] = None,
-        create_eval_env: bool = False,
-        eval_env: Union[GymEnv, str] = None,
-        monitor_wrapper: bool = True,
-        policy_kwargs: Optional[Dict[str, Any]] = None,
-        verbose: int = 0,
-        seed: Optional[int] = None,
-        device: Union[th.device, str] = "auto",
-        _init_setup_model: bool = True,
-        supported_action_spaces: Optional[Tuple[gym.spaces.Space, ...]] = None,
-    ):
-        super(PhaseTwoAlgorithm, self).__init__(
-            policy=policy,
-            env=env,
-            policy_base=ActorCriticPolicy,
-            learning_rate=learning_rate,
-            policy_kwargs=policy_kwargs,
-            verbose=verbose,
-            device=device,
-            use_sde=use_sde,
-            sde_sample_freq=sde_sample_freq,
-            create_eval_env=create_eval_env,
-            support_multi_env=True,
-            seed=seed,
-            tensorboard_log=tensorboard_log,
-            supported_action_spaces=supported_action_spaces,
-        )
+    def __init__(self, teacher, student, env, eval_env, cfg, log_dir, device):
+        dc = cfg["dagger"]
+        self.n_steps = int(dc["n_steps"])
+        self.n_epochs = int(dc["n_epochs"])
+        self.batch_size = int(dc["batch_size"])
+        self.learning_rate = float(dc["learning_rate"])
+        self.max_grad_norm = float(dc["max_grad_norm"])
+        self.eval_every = int(dc["eval_every"])
+        self.save_every = int(dc["save_every"])
+        self.n_eval_episodes = int(dc["n_eval_episodes"])
 
-        # Store algorithm parameters
-        self.env_latent_encoder = env_latent_encoder
-        self.n_steps = n_steps
-        self.gamma = gamma
-        self.gae_lambda = gae_lambda
-        self.use_tanh_act = use_tanh_act
-        self.ent_coef = ent_coef
-        self.vf_coef = vf_coef
-        self.max_grad_norm = max_grad_norm
-        self.rollout_buffer = None
-
-        # Store adaptation module specific parameters
-        self.history_len = history_len
-        self.act_size = act_size
-        self.state_obs_size = state_obs_size
-        self.env_obs_size = env_obs_size
-        self.latent_size = latent_size
-
-        # Setup evaluation environment
+        self.cfg = cfg
+        self.env = env
         self.eval_env = eval_env
+        self.device = device
+        self.log_dir = log_dir
 
-        if _init_setup_model:
-            self._setup_model()
+        self.teacher = teacher.to(device).eval()
+        for p in self.teacher.parameters():
+            p.requires_grad_(False)
+        self.head = FrozenHead(self.teacher)
+        self.student = student.to(device)
+        self.optimizer = th.optim.Adam(self.student.parameters(), lr=self.learning_rate)
 
-    def _setup_model(self) -> None:
-        """Initialize the model and setup the learning rate schedule."""
-        self._setup_lr_schedule()
-        self.set_random_seed(self.seed)
+        self.obs_size = env.obs_size  # [x_t, a_{t-1}, e]: the teacher's input
+        self.step_size = env.state_size + env.act_size  # [x_t, a_{t-1}]
+        self.student_input_size = self.step_size + env.history_size
+        self.latent_size = int(cfg["observation_space"]["latent_size"])
 
-        # Initialize rollout buffer
-        self.rollout_buffer = ExtrinsincsRolloutBuffer(
-            self.n_steps,
-            self.latent_size,
-            self.observation_space,
-            self.action_space,
-            self.device,
-            n_envs=self.n_envs,
-        )
+        self.num_timesteps = 0
+        self.ep_info_buffer = deque(maxlen=100)
+        self.best_z_mse = float("inf")
+        self._last_obs = None
 
-    def normalize_state_obs(self, obs_n_norm: np.ndarray, eval: bool = False) -> np.ndarray:
-        """
-        Normalize state observations.
-        
-        Parameters
-        ----------
-        obs_n_norm : np.ndarray
-            Observations to normalize
-        eval : bool
-            Whether to use evaluation normalization
-            
-        Returns
-        -------
-        np.ndarray
-            Normalized observations
-        """
-        obs_mean, obs_var = self.env.get_obs_norm()
+    # ---- observation split and the frozen teacher ----
 
-        # Normalize state history
-        obs_state_history_n_normalized = obs_n_norm[:, -self.history_len*(
-            self.act_size+self.state_obs_size):-self.history_len*self.act_size]
-        obs_state_mean = np.tile(obs_mean[:self.state_obs_size], [self.n_envs, self.history_len])
-        obs_state_var = np.tile(obs_var[:self.state_obs_size], [self.n_envs, self.history_len])
-        obs_state_history_normalized = (
-            obs_state_history_n_normalized - obs_state_mean) / np.sqrt(obs_state_var + 1e-8)
-        
-        # Normalize action history
-        obs_act_history_n_normalized = obs_n_norm[:, -self.history_len*self.act_size:]
-        obs_act_mean = np.tile(obs_mean[self.state_obs_size:self.state_obs_size+self.act_size], [self.n_envs, self.history_len])
-        obs_act_var = np.tile(obs_var[self.state_obs_size:self.state_obs_size+self.act_size], [self.n_envs, self.history_len])
-        obs_act_history_normalized = (
-            obs_act_history_n_normalized - obs_act_mean) / np.sqrt(obs_act_var + 1e-8)
+    def _split(self, obs):
+        """Env observation -> (teacher input [x_t, a_{t-1}, e], student input [x_t, a_{t-1}, history])."""
+        obs = th.as_tensor(obs, device=self.device)
+        return obs[:, :self.obs_size], th.cat((obs[:, :self.step_size], obs[:, self.obs_size:]), dim=1)
 
-        # Update normalized observations
-        obs_n_norm[:, -self.history_len*(self.act_size+self.state_obs_size):-self.history_len*self.act_size] = obs_state_history_normalized
-        obs_n_norm[:, -self.history_len*self.act_size:] = obs_act_history_normalized
+    def teacher_latent(self, teacher_obs):
+        return self.teacher.mlp_extractor.shared_net(self.teacher.extract_features(teacher_obs))
 
-        return obs_n_norm
+    def _sync(self):
+        if self.device.type == "cuda":
+            th.cuda.synchronize()  # GPU work is asynchronous: wait for it, or the timing is too short
 
-    def collect_rollouts(
-        self,
-        env: VecEnv,
-        callback: BaseCallback,
-        rollout_buffer: ExtrinsincsRolloutBuffer,
-        n_rollout_steps: int,
-    ) -> bool:
-        """
-        Collect experiences using the current policy and fill a rollout buffer.
-        
-        Parameters
-        ----------
-        env : VecEnv
-            The training environment
-        callback : BaseCallback
-            Callback that will be called at each step
-        rollout_buffer : ExtrinsincsRolloutBuffer
-            Buffer to fill with rollouts
-        n_rollout_steps : int
-            Number of experiences to collect per environment
-            
-        Returns
-        -------
-        bool
-            True if function returned with at least n_rollout_steps collected,
-            False if callback terminated rollout prematurely
-        """
-        assert self._last_obs is not None, "No previous observation was provided"
-        n_steps = 0
-        rollout_buffer.reset()
+    # ---- data collection, training, evaluation ----
 
-        callback.on_rollout_start()
+    def collect_rollouts(self):
+        """Student flies n_steps per env; returns (student inputs, teacher latents) flattened over envs."""
+        n_envs = self.env.num_envs
+        inputs = np.zeros((self.n_steps, n_envs, self.student_input_size), dtype=np.float32)
+        targets = np.zeros((self.n_steps, n_envs, self.latent_size), dtype=np.float32)
+        sim_time, inference_time = 0.0, 0.0
 
-        while n_steps < n_rollout_steps:
-            # Normalize observations
-            obs_n_norm = self._last_obs
-            obs_norm = self.normalize_state_obs(obs_n_norm)
-
+        obs = self._last_obs
+        for k in range(self.n_steps):
+            start = time.perf_counter()
             with th.no_grad():
-                # Convert to pytorch tensor
-                obs_tensor = th.as_tensor(obs_norm).to(self.device)
+                teacher_obs, student_obs = self._split(obs)
+                z = self.teacher_latent(teacher_obs)
+                actions = self.head(self.student(student_obs))
+                self._sync()
+            inference_time += time.perf_counter() - start
+            inputs[k] = student_obs.cpu().numpy()
+            targets[k] = z.cpu().numpy()
 
-                # Extract features and compute latent representations
-                obs_current = obs_tensor[:, :-self.history_len*(self.act_size+self.state_obs_size)]
-                obs_history = obs_tensor[:, -self.history_len*(self.act_size+self.state_obs_size):]
-                features = self.policy.extract_features(obs_current)
+            start = time.perf_counter()
+            obs, _, _, infos = self.env.step(actions.cpu().numpy())
+            sim_time += time.perf_counter() - start
+            self.num_timesteps += n_envs
+            for info in infos:
+                if "episode" in info:
+                    self.ep_info_buffer.append(info["episode"])
+        self._last_obs = obs
 
-                # Compute shared and environment latent representations
-                shared_latent_base = self.policy.mlp_extractor.shared_net(features[:, :-self.env_obs_size])
-                extrinsincs = self.policy.mlp_extractor.env_net(features[:, -self.env_obs_size:])
-                
-                # Store last true extrinsics for first step
-                if n_steps == 0:
-                    last_true_extrinsics = extrinsincs
-                    
-                # Compute estimated extrinsics
-                est_extrinsincs = self.env_latent_encoder(obs_history.float())
+        return (inputs.reshape(-1, self.student_input_size), targets.reshape(-1, self.latent_size),
+                sim_time, inference_time)
 
-                # Combine latent representations
-                shared_latent = th.cat((shared_latent_base, est_extrinsincs), 1)
-                latent_pi = self.policy.mlp_extractor.policy_net(shared_latent)
-                latent_vf = self.policy.mlp_extractor.value_net(shared_latent)
+    def train(self, inputs, targets):
+        """n_epochs of minibatch MSE(ẑ, z) on this rollout. Returns the mean loss."""
+        self.student.train()
+        x = th.as_tensor(inputs, device=self.device)
+        y = th.as_tensor(targets, device=self.device)
+        losses = []
+        for _ in range(self.n_epochs):
+            permutation = th.randperm(len(x), device=self.device)
+            for start in range(0, len(x), self.batch_size):
+                idx = permutation[start:start + self.batch_size]
+                loss = F.mse_loss(self.student(x[idx]), y[idx])
+                self.optimizer.zero_grad()
+                loss.backward()
+                th.nn.utils.clip_grad_norm_(self.student.parameters(), self.max_grad_norm)
+                self.optimizer.step()
+                losses.append(loss.item())
+        return float(np.mean(losses))
 
-                # Get actions
-                distribution = self.policy._get_action_dist_from_latent(latent_pi)
-                actions = distribution.get_actions(deterministic=True)
+    @th.no_grad()
+    def eval(self, teacher_flies=False):
+        """Fly the eval env deterministically. teacher_flies=True uses the true z (Phase 1 baseline)."""
+        self.student.eval()
+        env = self.eval_env
+        prefix = "eval_teacher" if teacher_flies else "eval"
+        returns, lengths, crashes, rate_rmse, z_errors, action_gaps = [], [], [], [], [], []
+        obs = env.reset()
+        while len(returns) < self.n_eval_episodes:
+            teacher_obs, student_obs = self._split(obs)
+            z = self.teacher_latent(teacher_obs)
+            z_hat = self.student(student_obs)
+            teacher_action, student_action = self.head(z), self.head(z_hat)
+            z_errors.append(F.mse_loss(z_hat, z).item())
+            action_gaps.append(F.mse_loss(student_action, teacher_action).item())
+            actions = teacher_action if teacher_flies else student_action
+            obs, _, dones, infos = env.step(actions.cpu().numpy())
+            if dones[0]:
+                returns.append(infos[0]["episode"]["r"])
+                lengths.append(infos[0]["episode"]["l"])
+                crashes.append(infos[0]["crashed"])
+                rate_rmse.append(infos[0]["rate_rmse"])
+        return {
+            prefix + "/ep_return": float(np.mean(returns)),
+            prefix + "/ep_length": float(np.mean(lengths)),
+            prefix + "/crash_fraction": float(np.mean(crashes)),
+            prefix + "/rate_rmse": float(np.mean(rate_rmse)),
+            prefix + "/z_mse": float(np.mean(z_errors)),
+            prefix + "/action_gap": float(np.mean(action_gaps)),
+        }
 
-            actions = actions.cpu().numpy()
+    # ---- saving ----
 
-            # Clip actions if needed
-            clipped_actions = actions
-            if isinstance(self.action_space, spaces.Box):
-                clipped_actions = np.clip(
-                    actions, self.action_space.low, self.action_space.high
-                )
+    def save(self, iteration):
+        """Student weights, the TorchScript deploy policy (student input -> action) and the RMS used."""
+        student_dir = os.path.join(self.log_dir, "Student")
+        deploy_dir = os.path.join(self.log_dir, "Deploy")
+        os.makedirs(student_dir, exist_ok=True)
+        os.makedirs(deploy_dir, exist_ok=True)
+        th.save(self.student.state_dict(), os.path.join(student_dir, "iter_{:05d}.pth".format(iteration)))
 
-            # Perform action in environment
-            new_obs, rewards, dones, infos = env.step(clipped_actions)
-            self.num_timesteps += env.num_envs
+        deploy = DeployPolicy(self.student, self.head).eval()
+        example = th.zeros(1, self.student_input_size, device=self.device)
+        with th.no_grad():
+            graph = th.jit.trace(deploy, example)
+        th.jit.save(graph, os.path.join(deploy_dir, "iter_{:05d}.pt".format(iteration)))
+        self.env.save_rms(save_dir=os.path.join(self.log_dir, "RMS"), n_iter=iteration)
 
-            # Update callback
-            callback.update_locals(locals())
-            if callback.on_step() is False:
-                return False
+    def _log(self, metrics):
+        wandb.log(metrics, step=self.num_timesteps)
 
-            self._update_info_buffer(infos)
-            n_steps += 1
+    # ---- main loop ----
 
-            # Reshape actions if discrete
-            if isinstance(self.action_space, spaces.Discrete):
-                actions = actions.reshape(-1, 1)
+    def learn(self, total_timesteps):
+        os.makedirs(self.log_dir, exist_ok=True)
+        with open(os.path.join(self.log_dir, "config.yaml"), "w") as outfile:
+            YAML().dump(self.cfg, outfile)
+        print("Phase 2 logging to", self.log_dir)
 
-            # Add experience to buffer
-            rollout_buffer.add(
-                obs_norm, actions, rewards, self._last_episode_starts,
-                extrinsincs, est_extrinsincs, last_true_extrinsics
-            )
-            
-            # Update last true extrinsics
-            with th.no_grad():
-                last_true_extrinsics = extrinsincs
-            
-            self._last_obs = new_obs
-            self._last_episode_starts = dones
+        # Baseline: the teacher flying on the true latent through the history env. Should match its
+        # Phase 1 eval; if it does not, the checkpoint, RMS or observation layout is wrong.
+        baseline = self.eval(teacher_flies=True)
+        self._log(baseline)
+        print("teacher baseline: {}".format({k: round(v, 3) for k, v in baseline.items()}))
 
-        callback.on_rollout_end()
-
-        return True
-
-    def train(self) -> None:
-        """
-        Update policy using the currently gathered rollout buffer.
-        To be implemented by child classes.
-        """
-        raise NotImplementedError
-
-    def learn(
-        self,
-        total_timesteps: int,
-        callback: MaybeCallback = None,
-        log_interval: Tuple = (10, 100),
-        eval_env: Optional[GymEnv] = None,
-        eval_freq: int = -1,
-        n_eval_episodes: int = 5,
-        tb_log_name: str = "PhaseTwoAlgorithm",
-        eval_log_path: Optional[str] = None,
-        reset_num_timesteps: bool = True,
-        env_cfg: str = None,
-    ) -> "PhaseTwoAlgorithm":
-        """
-        Train the policy for a specified number of timesteps.
-        
-        Parameters
-        ----------
-        total_timesteps : int
-            Total number of timesteps to train for
-        callback : MaybeCallback, optional
-            Callback(s) called at every step with state of the algorithm
-        log_interval : Tuple, optional
-            The interval for logging
-        eval_env : Optional[GymEnv], optional
-            Environment to use for evaluation
-        eval_freq : int, optional
-            Evaluate the policy every eval_freq timesteps
-        n_eval_episodes : int, optional
-            Number of episodes to evaluate on
-        tb_log_name : str, optional
-            Name of the run for tensorboard log
-        eval_log_path : Optional[str], optional
-            Path to a folder where the evaluations will be saved
-        reset_num_timesteps : bool, optional
-            Whether or not to reset the current timestep number
-        env_cfg : str, optional
-            Environment configuration
-            
-        Returns
-        -------
-        PhaseTwoAlgorithm
-            The trained algorithm
-        """
+        self._last_obs = self.env.reset()
         iteration = 0
-
-        # Setup training
-        total_timesteps, callback = self._setup_learn(
-            total_timesteps,
-            eval_env,
-            callback,
-            eval_freq,
-            n_eval_episodes,
-            eval_log_path,
-            reset_num_timesteps,
-            tb_log_name,
-        )
-
-        # Save configuration
-        new_cfg_dir = self.logger.get_dir() + "/config.yaml"
-        with open(new_cfg_dir, "w") as outfile:
-            YAML().dump(self.env_cfg, outfile)
-
-        callback.on_training_start(locals(), globals())
+        total_iterations = math.ceil(total_timesteps / (self.env.num_envs * self.n_steps))
 
         while self.num_timesteps < total_timesteps:
-            # Collect rollouts
-            continue_training = self.collect_rollouts(
-                self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_steps
-            )
-
-            if continue_training is False:
-                break
-
+            rollout_start = time.perf_counter()
+            inputs, targets, sim_time, inference_time = self.collect_rollouts()
+            rollout_time = time.perf_counter() - rollout_start
             iteration += 1
-            self._update_current_progress_remaining(self.num_timesteps, total_timesteps)
 
-            # Update policy
-            self.train()
+            train_start = time.perf_counter()
+            z_mse = self.train(inputs, targets)
+            train_time = time.perf_counter() - train_start
 
-            # Save model and evaluate
-            if log_interval is not None and iteration % log_interval[1] == 0:
-                policy_path = self.logger.get_dir() + "/Policy"
-                os.makedirs(policy_path, exist_ok=True)
-                example_input = th.rand(1, (self.state_obs_size + self.act_size) *
-                                      self.history_len + self.state_obs_size + self.act_size +
-                                      self.env_obs_size).cpu()
-                self.save_deterministic_graph(
-                    policy_path + f"/iter_{iteration:05d}.pt", example_input
-                )
-                self.eval(iteration)
+            metrics = {
+                "train/z_mse": z_mse,
+                "time/sim_s": sim_time,
+                "time/policy_inference_s": inference_time,
+                "time/rollout_overhead_s": rollout_time - sim_time - inference_time,
+                "time/train_s": train_time,
+                "time/steps_per_s": self.env.num_envs * self.n_steps / (rollout_time + train_time),
+            }
+            if len(self.ep_info_buffer) > 0:
+                metrics["train/ep_return"] = safe_mean([ep["r"] for ep in self.ep_info_buffer])
+                metrics["train/ep_length"] = safe_mean([ep["l"] for ep in self.ep_info_buffer])
+            self._log(metrics)
 
-        callback.on_training_end()
+            percent = min(100.0, 100.0 * self.num_timesteps / total_timesteps)
+            print(f"\riter {iteration}/{total_iterations} | {self.num_timesteps:,}/{total_timesteps:,} steps "
+                  f"({percent:.0f}%) | z_mse {z_mse:.4f}\x1b[K", end="", flush=True)
 
+            if iteration % self.eval_every == 0:
+                eval_start = time.perf_counter()
+                eval_metrics = self.eval()
+                eval_metrics["time/eval_s"] = time.perf_counter() - eval_start
+                self._log(eval_metrics)
+                print("\neval iter {}: {}".format(iteration, {k: round(v, 4) for k, v in eval_metrics.items()}))
+                if eval_metrics["eval/z_mse"] < self.best_z_mse:
+                    self.best_z_mse = eval_metrics["eval/z_mse"]
+                    self._log({"eval/save_at_iter": iteration})
+                    self.save(888)
+
+            if iteration % self.save_every == 0:
+                self.save(iteration)
+
+        print()  # leave the finished progress line on screen
         return self
-
-    def save_deterministic_graph(
-        self,
-        fname_env_latent_encoder: str,
-        example_input: th.Tensor,
-        device: str = 'cpu'
-    ) -> None:
-        """
-        Save the environment latent encoder as a deterministic graph.
-        
-        Parameters
-        ----------
-        fname_env_latent_encoder : str
-            Filename to save the encoder to
-        example_input : th.Tensor
-            Example input for tracing
-        device : str, optional
-            Device to use for tracing
-        """
-        hlen = (self.state_obs_size + self.act_size) * self.history_len
-        prop_encoder_graph = th.jit.trace(
-            self.env_latent_encoder.to(device), example_input[:, -hlen:]
-        )
-        th.jit.save(prop_encoder_graph, fname_env_latent_encoder)
-        self.env_latent_encoder.to(self.device)
-
-class DAGGER(PhaseTwoAlgorithm):
-    """
-    DAGGER (Dataset Aggregation) algorithm for Phase Two.
-    
-    This implementation is based on the DAGGER algorithm from the paper:
-    "A Reduction of Imitation Learning and Structured Prediction to No-Regret Online Learning"
-    by Ross et al. (2011)
-    https://www.cs.cmu.edu/~sross1/publications/Ross-AIStats11-NoRegret.pdf
-
-    Parameters
-    ----------
-    env_latent_encoder : nn.Module
-        Neural network for encoding environment latent information
-    policy : Union[str, Type[ActorCriticPolicy]]
-        The policy model to use
-    env : Union[GymEnv, str]
-        The environment to learn from
-    learning_rate : Union[float, Schedule]
-        The learning rate
-    n_steps : int
-        The number of steps to run for each environment per update
-    use_tanh_act : bool
-        Whether to use tanh activation for actions
-    gamma : float
-        Discount factor
-    gae_lambda : float
-        Factor for trade-off of bias vs variance for GAE
-    ent_coef : float
-        Entropy coefficient for the loss calculation
-    vf_coef : float
-        Value function coefficient for the loss calculation
-    max_grad_norm : float
-        The maximum value for the gradient clipping
-    use_sde : bool
-        Whether to use State Dependent Exploration
-    sde_sample_freq : int
-        Sample a new noise matrix every n steps when using gSDE
-    history_len : int
-        Length of history to use for latent encoding
-    state_obs_size : int
-        Size of state observations
-    env_obs_size : int
-        Size of environment observations
-    latent_size : int
-        Size of latent space
-    act_size : int
-        Size of action space
-    tensorboard_log : Optional[str]
-        The log location for tensorboard
-    create_eval_env : bool
-        Whether to create a second environment for evaluation
-    eval_env : Union[GymEnv, str]
-        The environment used for evaluation
-    monitor_wrapper : bool
-        Whether to wrap the environment in a Monitor wrapper
-    policy_kwargs : Optional[Dict[str, Any]]
-        Additional arguments to be passed to the policy on creation
-    verbose : int
-        The verbosity level: 0 no output, 1 info, 2 debug
-    seed : Optional[int]
-        Seed for the pseudo random generators
-    device : Union[th.device, str]
-        Device (cpu, cuda, ...) on which the code should be run
-    _init_setup_model : bool
-        Whether or not to build the network at the creation of the instance
-    supported_action_spaces : Optional[Tuple[gym.spaces.Space, ...]]
-        The action spaces supported by the algorithm
-    """
-
-    def __init__(
-        self,
-        env_latent_encoder: nn.Module,
-        policy: Union[str, Type[ActorCriticPolicy]],
-        env: Union[GymEnv, str],
-        learning_rate: Union[float, Schedule],
-        n_steps: int,
-        use_tanh_act: bool,
-        gamma: float,
-        gae_lambda: float,
-        ent_coef: float,
-        vf_coef: float,
-        max_grad_norm: float,
-        use_sde: bool,
-        sde_sample_freq: int,
-        history_len: int,
-        state_obs_size: int,
-        env_obs_size: int,
-        latent_size: int,
-        act_size: int,
-        tensorboard_log: Optional[str] = None,
-        create_eval_env: bool = False,
-        eval_env: Union[GymEnv, str] = None,
-        monitor_wrapper: bool = True,
-        policy_kwargs: Optional[Dict[str, Any]] = None,
-        verbose: int = 0,
-        seed: Optional[int] = None,
-        device: Union[th.device, str] = "auto",
-        _init_setup_model: bool = True,
-        supported_action_spaces: Optional[Tuple[gym.spaces.Space, ...]] = None,
-    ):
-        super(DAGGER, self).__init__(
-            env_latent_encoder=env_latent_encoder,
-            policy=policy,
-            env=env,
-            learning_rate=learning_rate,
-            n_steps=n_steps,
-            use_tanh_act=use_tanh_act,
-            gamma=gamma,
-            gae_lambda=gae_lambda,
-            ent_coef=ent_coef,
-            vf_coef=vf_coef,
-            max_grad_norm=max_grad_norm,
-            use_sde=use_sde,
-            sde_sample_freq=sde_sample_freq,
-            history_len=history_len,
-            state_obs_size=state_obs_size,
-            env_obs_size=env_obs_size,
-            latent_size=latent_size,
-            act_size=act_size,
-            tensorboard_log=tensorboard_log,
-            create_eval_env=create_eval_env,
-            eval_env=eval_env,
-            monitor_wrapper=monitor_wrapper,
-            policy_kwargs=policy_kwargs,
-            verbose=verbose,
-            seed=seed,
-            device=device,
-            _init_setup_model=_init_setup_model,
-            supported_action_spaces=supported_action_spaces,
-        )
-
-        # Initialize optimizer and scheduler
-        self.optimizer = optim.Adam(
-            [*self.env_latent_encoder.parameters()],
-            lr=learning_rate
-        )
-        self.scheduler = optim.lr_scheduler.StepLR(
-            self.optimizer, step_size=200, gamma=0.1
-        )
-        self.loss_fn = nn.MSELoss()
-        self.best_loss = float('inf')
-
-    def train(self) -> None:
-        """
-        Update policy using the currently gathered rollout buffer.
-        
-        This method implements the DAGGER training loop, including:
-        1. Environment latent encoder updates
-        2. Policy updates with extrinsic information
-        3. Loss computation and optimization
-        """
-        # Train for n_epochs epochs
-        extrinsics_mse = 0
-        loss_counter = 0
-
-        for rollout_data in self.rollout_buffer.get(self.batch_size):
-            # Get observations and compute features
-            obs_tensor = th.as_tensor(rollout_data["observations"]).to(self.device)
-            obs_current = obs_tensor[:, :-self.history_len*(self.act_size+self.state_obs_size)]
-            obs_history = obs_tensor[:, -self.history_len*(self.act_size+self.state_obs_size):]
-            features = self.policy.extract_features(obs_current)
-
-            # Get true and estimated extrinsics
-            true_extrinsincs = self.policy.mlp_extractor.env_net(
-                features[:, -self.env_obs_size:]
-            ).clone()
-            est_extrinsincs = self.env_latent_encoder(obs_history.float()).clone()
-
-            # Compute loss
-            loss = self.loss_fn(est_extrinsincs, true_extrinsincs)
-
-            # Optimization step
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-
-            # Update metrics
-            extrinsics_mse += loss.item()
-            loss_counter += 1
-
-        # Update learning rate
-        self.scheduler.step()
-
-        # Compute average loss
-        avg_extrinsics_loss = extrinsics_mse / loss_counter
-
-        # Log metrics
-        self._n_updates += 1
-
-        # Save best model
-        if avg_extrinsics_loss < self.best_loss:
-            self.best_loss = avg_extrinsics_loss
-            policy_path = self.logger.get_dir() + "/Policy"
-            os.makedirs(policy_path, exist_ok=True)
-            example_input = th.rand(1, (self.state_obs_size + self.act_size) *
-                                  self.history_len + self.state_obs_size + self.act_size +
-                                  self.env_obs_size).cpu()
-            self.save_deterministic_graph(
-                policy_path + "/iter_888.pt", example_input
-            )
-            self.eval()
-
-        # Log metrics
-        self.logger.record("train/loss", loss.item())
-        self.logger.record("train/avg_extrinsics_loss", avg_extrinsics_loss)
-        self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
-
-   

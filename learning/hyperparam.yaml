@@ -26,6 +26,17 @@ observation_space:
   env_obs_size: 7 # physical parameters given to the teacher
   latent_size: 8
 
+dagger: # Phase 2: student regresses the frozen Phase 1 8-dim latent, on-policy
+  total_timesteps: 4.0e+5
+  n_steps: 2500 # one full max_t = 5 s episode per env per iteration, as Phase 1
+  n_epochs: 5
+  batch_size: 2500
+  learning_rate: 1.0e-3
+  max_grad_norm: 1.0
+  eval_every: 5 # iterations
+  save_every: 10 # iterations
+  n_eval_episodes: 10
+
 rewards:
   yaw_vel_coeff: -0.2 # for yaw rate tracking
   pitch_vel_coeff: -0.2 # for pitch rate tracking

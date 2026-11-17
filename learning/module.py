@@ -1,3 +1,4 @@
+import torch as th
 import torch.nn as nn
 
 
@@ -60,6 +61,29 @@ class StateHistoryEncoder(nn.Module):
         bs = obs.shape[0]
         T = self.tsteps
         projection = self.encoder(obs.reshape([bs * T, -1]))
-        output = self.conv_layers(projection.reshape([bs, -1, T]))
+        # (bs, T, channels) -> (bs, channels, T) for Conv1d. A plain reshape to (bs, -1, T) would mix
+        # time steps and channels instead of transposing them.
+        output = self.conv_layers(projection.reshape([bs, T, -1]).permute(0, 2, 1))
         output = self.linear_output(output)
         return output
+
+
+class HistoryLatentStudent(nn.Module):
+    """Phase 2 student: [x_t, a_{t-1}] plus the history before it -> estimate of the Phase 1 8-dim latent.
+
+    Input is one flat vector: the current step (step_size) followed by history_len past steps, oldest
+    first, each [x_k, a_{k-1}]. The frozen Phase 1 policy_net / action_net fly on the output.
+    """
+
+    def __init__(self, step_size, history_len, latent_size, history_features=64, hidden=128):
+        super(HistoryLatentStudent, self).__init__()
+        self.step_size = step_size
+        self.history_encoder = StateHistoryEncoder(nn.Tanh, step_size, history_len, history_features)
+        self.head = nn.Sequential(
+            nn.Linear(step_size + history_features, hidden), nn.Tanh(),
+            nn.Linear(hidden, latent_size), nn.Tanh(),  # the Phase 1 latent is a Tanh output too
+        )
+
+    def forward(self, x):
+        current, history = x[:, :self.step_size], x[:, self.step_size:]
+        return self.head(th.cat((current, self.history_encoder(history)), dim=1))

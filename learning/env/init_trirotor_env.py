@@ -11,6 +11,7 @@ example:
 PX4 rate controller + mixer -> expert action in the same 6 outputs, used for behaviour cloning  
 
 Observation: state (10, includes the commanded body rates), last action (6), physical parameters (7, last).
+Phase 2 (with_history) appends history_len past [state, last action] steps, ending one step before the current one.
 Each parameter is `sampled / nominal - 1`, resampled at every episode start. Controllers and the mixer
 keep the nominal constants, as they would on the real vehicle. Aerodynamic coefficients stay nominal.
 """
@@ -123,8 +124,9 @@ def rotate_to_body(q, v):
 class _Vehicle:
     """One simulated vehicle with its offboard guidance and expert."""
 
-    def __init__(self, cfg, nominal, mixer, att_ctrl, rng):
+    def __init__(self, cfg, nominal, mixer, att_ctrl, rng, history_len=0):
         sim = cfg["simulation"]
+        self.history_len = history_len  # 0: no history (Phase 1)
         self.dt = float(sim["sim_dt"])
         self.dt_us = int(round(self.dt * 1e6))
         self.max_steps = int(round(float(sim["max_t"]) / self.dt))
@@ -239,8 +241,11 @@ class _Vehicle:
         self.prev_vel = VEL_TRIM.copy()
         self._read_state()
         self._compute_expert()
+        self.history = collections.deque(maxlen=max(self.history_len, 1))
         while self.step_index < 0:
+            self._push_history()
             self._advance(self.expert_action)
+            self.last_action = self.expert_action.copy()
         self.last_action = self.expert_action.copy()
 
     def _limit_attitude(self, att):
@@ -319,6 +324,7 @@ class _Vehicle:
 
     def step(self, action):
         """Returns (reward, done, info). Reward terms are per second, scaled by dt."""
+        self._push_history()
         self._advance(action)
         error = self.ang_vel - self.cmd_ang_vel
         rate_cost = (self.rew["roll_vel_coeff"] * error[0] ** 2 + self.rew["pitch_vel_coeff"] * error[1] ** 2
@@ -344,32 +350,50 @@ class _Vehicle:
             info["TimeLimit.truncated"] = timed_out and not crashed
         return reward, crashed or timed_out, info
 
+    def _state(self):
+        return np.array([self.ang_vel[0], self.ang_vel[1], self.ang_vel[2], self.proper_acc_x,
+                         self.cmd_ang_vel[0], self.cmd_ang_vel[1], self.cmd_ang_vel[2], self.cmd_thrust,
+                         self.airspeed, self.alpha])
+
+    def _push_history(self):
+        """Store [x_t, a_{t-1}] before the vehicle advances, so the history seen at the next observation
+        ends one step before it and never repeats the current state or last action."""
+        if self.history_len > 0:
+            self.history.append(np.concatenate((self._state(), self.last_action)))
+
     def observation(self):
-        return np.concatenate(([self.ang_vel[0], self.ang_vel[1], self.ang_vel[2], self.proper_acc_x,
-                                self.cmd_ang_vel[0], self.cmd_ang_vel[1], self.cmd_ang_vel[2], self.cmd_thrust,
-                                self.airspeed, self.alpha], self.last_action, self.parameters))
+        return np.concatenate((self._state(), self.last_action, self.parameters))
+
+    def history_observation(self):
+        """[x_k, a_{k-1}] for k = t-history_len ... t-1, oldest first, flattened."""
+        return np.concatenate(self.history)
 
 
 class TrirotorEnv(VecEnv):
     """Vectorized forward-flight environment. All vehicles step in this process."""
 
-    def __init__(self, cfg_yaml, render=False):
+    def __init__(self, cfg_yaml, render=False, with_history=False):
+        """with_history (Phase 2): append [x_k, a_{k-1}] for the history_len steps before the current one,
+        so the observation is [x_t, a_{t-1}, e, history] and no state or action appears twice."""
         cfg = YAML(typ="safe").load(cfg_yaml) if isinstance(cfg_yaml, str) else cfg_yaml
         self.cfg = cfg
         space = cfg["observation_space"]
         self.state_size, self.act_size, self.env_size = space["state_obs_size"], space["act_size"], space["env_obs_size"]
         if self.env_size != len(PARAMETER_NAMES):
             raise ValueError("env_obs_size must be {}".format(len(PARAMETER_NAMES)))
-        self.obs_size = self.state_size + self.act_size + self.env_size
+        self.obs_size = self.state_size + self.act_size + self.env_size  # the part the RMS covers
+        self.history_len = int(space["history_len"]) if with_history else 0
+        self.history_size = self.history_len * (self.state_size + self.act_size)
         num_envs = int(cfg["simulation"]["num_envs"])
         super().__init__(num_envs,
-                         spaces.Box(-np.inf, np.inf, shape=(self.obs_size,), dtype=np.float32),
+                         spaces.Box(-np.inf, np.inf, shape=(self.obs_size + self.history_size,), dtype=np.float32),
                          spaces.Box(-1.0, 1.0, shape=(self.act_size,), dtype=np.float32))
         self.nominal = GC.QuadcopterConstants(VEHICLE_ID)
         self.mixer = GC.TrirotorMixer(self.nominal)
         self.att_ctrl = GC.PX4FixedWingAttitudeController()
         self.rng = np.random.default_rng(int(cfg["simulation"]["seed"]))
-        self.vehicles = [_Vehicle(cfg, self.nominal, self.mixer, self.att_ctrl, self.rng) for _ in range(num_envs)]
+        self.vehicles = [_Vehicle(cfg, self.nominal, self.mixer, self.att_ctrl, self.rng, self.history_len)
+                         for _ in range(num_envs)]
         self.running_rms = RunningMeanStd(shape=(self.obs_size,))
         self.obs_mean = np.zeros(self.obs_size)
         self.obs_var = np.ones(self.obs_size)
@@ -381,7 +405,15 @@ class TrirotorEnv(VecEnv):
         raw = np.array([v.observation() for v in self.vehicles])
         if self.update_running_rms:
             self.running_rms.update(raw)
-        return np.clip((raw - self.obs_mean) / np.sqrt(self.obs_var + 1e-8), -10.0, 10.0).astype(np.float32)
+        obs = np.clip((raw - self.obs_mean) / np.sqrt(self.obs_var + 1e-8), -10.0, 10.0)
+        if self.history_len > 0:
+            # each history step is [x, a] and uses the RMS of the current x_t, a_{t-1}
+            step = self.state_size + self.act_size
+            mean = np.tile(self.obs_mean[:step], self.history_len)
+            std = np.sqrt(np.tile(self.obs_var[:step], self.history_len) + 1e-8)
+            hist = np.array([v.history_observation() for v in self.vehicles])
+            obs = np.concatenate((obs, np.clip((hist - mean) / std, -10.0, 10.0)), axis=1)
+        return obs.astype(np.float32)
 
     def reset(self):
         for v in self.vehicles:
