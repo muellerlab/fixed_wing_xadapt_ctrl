@@ -180,6 +180,8 @@ class DAGGER:
         env = self.eval_env
         prefix = "eval_teacher" if teacher_flies else "eval"
         returns, lengths, crashes, rate_rmse, z_errors, action_gaps = [], [], [], [], [], []
+        path_keys = ("path_y_iae", "path_z_iae", "path_y_rmse", "path_z_rmse")
+        path = {key: [] for key in path_keys}
         obs = env.reset()
         while len(returns) < self.n_eval_episodes:
             teacher_obs, student_obs = self._split(obs)
@@ -195,7 +197,9 @@ class DAGGER:
                 lengths.append(infos[0]["episode"]["l"])
                 crashes.append(infos[0]["crashed"])
                 rate_rmse.append(infos[0]["rate_rmse"])
-        return {
+                for key in path_keys:
+                    path[key].append(infos[0][key])
+        metrics = {
             prefix + "/ep_return": float(np.mean(returns)),
             prefix + "/ep_length": float(np.mean(lengths)),
             prefix + "/crash_fraction": float(np.mean(crashes)),
@@ -203,6 +207,9 @@ class DAGGER:
             prefix + "/z_mse": float(np.mean(z_errors)),
             prefix + "/action_gap": float(np.mean(action_gaps)),
         }
+        # ground path holding: ∫|e| dt over the episode [m·s] and RMS [m], cross-track (y) and altitude (z)
+        metrics.update({prefix + "/" + key: float(np.mean(values)) for key, values in path.items()})
+        return metrics
 
     # ---- saving ----
 

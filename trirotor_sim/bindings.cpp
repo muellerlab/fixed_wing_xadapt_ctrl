@@ -24,6 +24,7 @@
 #include "Components/Offboard/QuadcopterController.hpp"
 #include "Components/Offboard/TrirotorController.hpp"
 #include "Components/Offboard/TrirotorFixedWingController.hpp"
+#include "Components/Simulation/DrydenTurbulenceModel.hpp"
 #include "Components/Simulation/Trirotor_T.hpp"
 
 namespace py = pybind11;
@@ -419,6 +420,25 @@ PYBIND11_MODULE(GeneralCode, m) {
       .def("tail_angles", [](Simulation::Trirotor const &t) {  // actual (R, L) ruddervators [rad]
         return Eigen::Vector2d(t.GetSimTailSurfaceAngle(0), t.GetSimTailSurfaceAngle(1));
       });
+
+  // ---------------------------------------------------------------- turbulence
+  // Standalone Dryden model, so each vehicle can be seeded on its own: the one inside Trirotor always
+  // seeds its RNG with 0. Outputs are in the Dryden convention; Trirotor_T::Run maps them to the body
+  // frame as (x, -y, -z).
+  using Dryden = Simulation::DrydenTurbulenceModel;
+  py::enum_<Dryden::Intensity>(m, "TurbulenceIntensity")
+      .value("LIGHT", Dryden::LIGHT)
+      .value("MODERATE", Dryden::MODERATE)
+      .value("SEVERE", Dryden::SEVERE);
+
+  py::class_<Dryden>(m, "DrydenTurbulenceModel")
+      .def(py::init<double, double, double, Dryden::Intensity>(), py::arg("wingspan"), py::arg("altitude"),
+           py::arg("airspeed"), py::arg("intensity"))
+      .def("seed", &Dryden::Seed, py::arg("seed"))
+      .def("reset", &Dryden::Reset)
+      .def("simulate", &Dryden::Simulate, py::arg("dt"))
+      .def("linear_velocity", [](Dryden const &d) { return E(d.GetLinearVelocity()); })
+      .def("angular_velocity", [](Dryden const &d) { return E(d.GetAngularVelocity()); });
 
   // ---------------------------------------------------------------- offboard controller
   py::class_<Offboard::TrirotorController>(m, "TrirotorController")

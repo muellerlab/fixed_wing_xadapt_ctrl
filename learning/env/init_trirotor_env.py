@@ -10,10 +10,6 @@ example:
   where
 PX4 rate controller + mixer -> expert action in the same 6 outputs, used for behaviour cloning  
 
-Observation: state (10, includes the commanded body rates), last action (6), physical parameters (7, last).
-Phase 2 (with_history) appends history_len past [state, last action] steps, ending one step before the current one.
-Each parameter is `sampled / nominal - 1`, resampled at every episode start. Controllers and the mixer
-keep the nominal constants, as they would on the real vehicle. Aerodynamic coefficients stay nominal.
 """
 
 import atexit
@@ -45,9 +41,13 @@ COMMAND_FLAGS = GC.FLAG_SPEEDS_RAW_SERVO_CMDS | GC.FLAG_DISABLE_ONBOARD_STATE_SA
 PARAMETER_NAMES = ("mass", "inertia_xx", "inertia_yy", "inertia_zz", "propellerThrustFromSpeedSqr",
                    "propellerTorqueFromThrust", "motorTimeConst") #intrinsic parameters fed to the latent encoder***
 
-VEL_TRIM = np.array([TRIM_SPEED, 0.0, 0.0])
+VEL_TRIM = np.array([TRIM_SPEED, 0.0, 0.0])  # ground velocity tracked, with or without wind
 POS_START = np.array([0.0, 0.0, START_ALTITUDE])
-WIND = np.zeros(3)
+WIND = np.zeros(3)  # what the offboard guidance is told: it does not know the simulated wind
+TURBULENCE_INTENSITIES = {"light": GC.TurbulenceIntensity.LIGHT, "moderate": GC.TurbulenceIntensity.MODERATE,
+                          "severe": GC.TurbulenceIntensity.SEVERE}
+TURBULENCE_BURN_IN_DT = 0.01  # [s] step for running the gust filters to steady state before release
+WIND_SIZE = 3
 ACC_ZERO = np.zeros(3)
 PROPER_ACC_LEVEL = np.array([0.0, 0.0, GRAVITY])
 MOTOR_ANGLES = np.array([FORWARD_TILT, FORWARD_TILT, 0.0])
@@ -121,6 +121,12 @@ def rotate_to_body(q, v):
                      v[2] + w * tz - x * ty + y * tx])
 
 
+def rotate_to_world(q, v):
+    """Body vector -> inertial frame (inverse of rotate_to_body)."""
+    w, x, y, z = q
+    return rotate_to_body((w, -x, -y, -z), v)
+
+
 class _Vehicle:
     """One simulated vehicle with its offboard guidance and expert."""
 
@@ -136,6 +142,10 @@ class _Vehicle:
         self.com_delay = int(round(float(sim["com_latency"]) / self.dt))
         self.rand = cfg["randomization"]
         self.rew = cfg["rewards"]
+        # older configs have no wind/turbulence sections: both off
+        self.wind_cfg = cfg.get("wind", {"enabled": False, "privileged": False})
+        self.turb_cfg = cfg.get("turbulence", {"enabled": False})
+        self.turb_burn_in_t = float(self.turb_cfg.get("burn_in_t", 20.0))
         self.nominal = nominal
         self.mixer = mixer
         self.att_ctrl = att_ctrl
@@ -161,6 +171,29 @@ class _Vehicle:
                 fractions[i] = self.rng.uniform(-limit, limit)
                 setattr(c, name, getattr(self.nominal, name) * (1.0 + fractions[i]))
         return c, fractions
+
+    def _sample_wind(self):
+        """Steady world-frame wind for this episode: uniform direction, magnitude uniform in [0, max_speed]."""
+        if not self.wind_cfg["enabled"]:
+            return np.zeros(WIND_SIZE)
+        heading = self.rng.uniform(0.0, 2.0 * math.pi)
+        speed = self.rng.uniform(0.0, float(self.wind_cfg["max_speed"]))
+        vertical = float(self.wind_cfg.get("max_vertical", 0.0))
+        return np.array([speed * math.cos(heading), speed * math.sin(heading),
+                         self.rng.uniform(-vertical, vertical) if vertical > 0 else 0.0])
+
+    def _make_turbulence(self, wingspan, airspeed):
+        """Dryden gusts with their own seed from the env RNG, run to steady state (the filters start at
+        zero and the longitudinal time constant is several seconds at this altitude)."""
+        if not self.turb_cfg["enabled"]:
+            return None
+        names = list(self.turb_cfg["intensities"])
+        intensity = TURBULENCE_INTENSITIES[names[int(self.rng.integers(len(names)))]]
+        turbulence = GC.DrydenTurbulenceModel(wingspan, START_ALTITUDE, airspeed, intensity)
+        turbulence.seed(int(self.rng.integers(0, 2 ** 31 - 1)))
+        for _ in range(int(round(self.turb_burn_in_t / TURBULENCE_BURN_IN_DT))):
+            turbulence.simulate(TURBULENCE_BURN_IN_DT)
+        return turbulence
 
     def _make_vehicle(self, c):
         timer = GC.ManualTimer()
@@ -214,10 +247,19 @@ class _Vehicle:
     def reset(self, ypr_offset=None):
         """Start at the 15 m/s trim of the sampled vehicle, held while the actuators settle, then released
         with a perturbed attitude (as simulateC.py)."""
-        c, self.parameters = self._sample_constants()
+        c, fractions = self._sample_constants()
+        self.wind = self._sample_wind()  # steady, world frame
+        self.wind_total = self.wind.copy()  # steady + gust, what the sim is given
+        if self.wind_cfg.get("privileged", False):
+            scale = float(self.wind_cfg.get("max_speed", 0.0)) or 1.0
+            self.parameters = np.concatenate((fractions, self.wind / scale))
+        else:
+            self.parameters = fractions
         with _silence_c_stdout():
             self.timer, self.tri = self._make_vehicle(c)
-        trim = GC.CoordinatedFlightConditionSolver(self._aero_model(c, c.simAeroCoeffs)).solve(VEL_TRIM, PROPER_ACC_LEVEL)
+        air_vel_trim = VEL_TRIM - self.wind  # same ground velocity in any wind: trim for the air velocity
+        self.turbulence = self._make_turbulence(float(c.wingParams.b), float(np.linalg.norm(air_vel_trim)))
+        trim = GC.CoordinatedFlightConditionSolver(self._aero_model(c, c.simAeroCoeffs)).solve(air_vel_trim, PROPER_ACC_LEVEL)
         self.att_trim = trim.att
         if ypr_offset is None:
             ypr_offset = np.radians(self.rng.uniform(-10.0, 10.0, 3))
@@ -236,6 +278,8 @@ class _Vehicle:
         self.ep_return = 0.0
         self.ep_length = 0
         self.ep_rate_sq_error = 0.0
+        self.ep_path_abs = np.zeros(2)  # ∫|e| dt of (cross-track y, altitude z) from the straight path
+        self.ep_path_sq = np.zeros(2)
 
         self._set_state(self._trim_position(self.step_index * self.dt), self.att_trim)
         self.prev_vel = VEL_TRIM.copy()
@@ -256,8 +300,10 @@ class _Vehicle:
     def _read_state(self):
         tri = self.tri
         self.pos, self.vel, self.att, self.ang_vel = tri.position(), tri.velocity(), tri.attitude(), tri.angular_velocity()
-        self.airspeed_b = rotate_to_body(self.att, self.vel)
+        # true airspeed, gusts included, as a pitot would see it; ground velocity is self.vel
+        self.airspeed_b = rotate_to_body(self.att, self.vel - self.wind_total)
         self.airspeed = float(np.linalg.norm(self.airspeed_b))
+        self.steady_airspeed = float(np.linalg.norm(self.vel - self.wind))
         self.alpha = math.atan2(-self.airspeed_b[2], self.airspeed_b[0])
         acc = (self.vel - self.prev_vel) / self.dt
         self.prev_vel = self.vel
@@ -302,8 +348,20 @@ class _Vehicle:
             _, att, self.cmd_thrust = self.offboard_queue.popleft()
             self.cmd_att = self._limit_attitude(att)
 
+    def _update_wind(self):
+        """Steady wind plus this step's gust, given to the sim as one world-frame wind vector. Gusts are in
+        the Dryden convention; Trirotor_T::Run maps them to the body frame as (x, -y, -z) and subtracts
+        them from the body airspeed, so adding the rotated gust to the wind gives the same airspeed."""
+        if self.turbulence is not None:
+            self.turbulence.simulate(self.dt)
+            g = self.turbulence.linear_velocity()
+            self.wind_total = self.wind + rotate_to_world(self.att, np.array([g[0], -g[1], -g[2]]))
+        if self.turbulence is not None or self.wind_cfg["enabled"]:
+            self.tri.set_wind(self.wind_total)
+
     def _advance(self, action):
         self._apply_action(action)
+        self._update_wind()
         self.tri.run()
         self.timer.advance_us(self.dt_us)
         self.step_index += 1
@@ -318,8 +376,9 @@ class _Vehicle:
 
     def _crashed(self):
         _, pitch, roll = ypr_from_quat(self.att)
+        # steady-wind airspeed: a single gust spike does not end the episode (the aero model has no stall)
         return (abs(roll) > math.radians(70.0) or abs(pitch) > math.radians(50.0)
-                or not 8.0 < self.airspeed < 30.0 or self.pos[2] < 2.0
+                or not 8.0 < self.steady_airspeed < 30.0 or self.pos[2] < 2.0
                 or float(np.linalg.norm(self.ang_vel)) > 15.0)
 
     def step(self, action):
@@ -342,11 +401,17 @@ class _Vehicle:
         self.ep_return += reward
         self.ep_length += 1
         self.ep_rate_sq_error += float(np.sum(error ** 2))
+        path_error = np.array([self.pos[1] - POS_START[1], self.pos[2] - POS_START[2]])  # cross-track, altitude
+        self.ep_path_abs += np.abs(path_error) * self.dt
+        self.ep_path_sq += path_error ** 2
         info = {}
         if crashed or timed_out:
             info["episode"] = {"r": self.ep_return, "l": self.ep_length, "t": 0.0}
             info["crashed"] = crashed
             info["rate_rmse"] = math.sqrt(self.ep_rate_sq_error / max(self.ep_length, 1))
+            path_rmse = np.sqrt(self.ep_path_sq / max(self.ep_length, 1))
+            info["path_y_iae"], info["path_z_iae"] = float(self.ep_path_abs[0]), float(self.ep_path_abs[1])
+            info["path_y_rmse"], info["path_z_rmse"] = float(path_rmse[0]), float(path_rmse[1])
             info["TimeLimit.truncated"] = timed_out and not crashed
         return reward, crashed or timed_out, info
 
@@ -379,8 +444,11 @@ class TrirotorEnv(VecEnv):
         self.cfg = cfg
         space = cfg["observation_space"]
         self.state_size, self.act_size, self.env_size = space["state_obs_size"], space["act_size"], space["env_obs_size"]
-        if self.env_size != len(PARAMETER_NAMES):
-            raise ValueError("env_obs_size must be {}".format(len(PARAMETER_NAMES)))
+        privileged_wind = cfg.get("wind", {}).get("privileged", False)
+        expected = len(PARAMETER_NAMES) + (WIND_SIZE if privileged_wind else 0)
+        if self.env_size != expected:
+            raise ValueError("env_obs_size must be {} ({} physical parameters{})".format(
+                expected, len(PARAMETER_NAMES), " + 3 wind" if privileged_wind else ""))
         self.obs_size = self.state_size + self.act_size + self.env_size  # the part the RMS covers
         self.history_len = int(space["history_len"]) if with_history else 0
         self.history_size = self.history_len * (self.state_size + self.act_size)

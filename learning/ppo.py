@@ -490,6 +490,8 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         env.set_obs_norm(*self.env.get_obs_norm())
 
         returns, lengths, crashes, rate_rmse, bc_errors = [], [], [], [], []
+        path_keys = ("path_y_iae", "path_z_iae", "path_y_rmse", "path_z_rmse")
+        path = {key: [] for key in path_keys}
         obs = env.reset()
         while len(returns) < n_episodes:
             actions, _ = self.policy.predict(obs, deterministic=True)
@@ -500,6 +502,8 @@ class OnPolicyAlgorithm(BaseAlgorithm):
                 lengths.append(infos[0]["episode"]["l"])
                 crashes.append(infos[0]["crashed"])
                 rate_rmse.append(infos[0]["rate_rmse"])
+                for key in path_keys:
+                    path[key].append(infos[0][key])
 
         metrics = {
             "eval/ep_return": float(np.mean(returns)),
@@ -508,6 +512,8 @@ class OnPolicyAlgorithm(BaseAlgorithm):
             "eval/rate_rmse": float(np.mean(rate_rmse)),
             "eval/BC_loss": float(np.mean(bc_errors)),
         }
+        # ground path holding: ∫|e| dt over the episode [m·s] and RMS [m], cross-track (y) and altitude (z)
+        metrics.update({"eval/" + key: float(np.mean(values)) for key, values in path.items()})
         for key, value in metrics.items():
             self.logger.record(key, value)
         wandb.log(metrics, step=self.num_timesteps)

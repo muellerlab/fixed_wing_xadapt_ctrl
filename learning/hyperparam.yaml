@@ -19,11 +19,22 @@ randomization: # uniform, +/- fraction of nominal, resampled every episode
   propellerTorqueFromThrust: 0.15
   motorTimeConst: 0.30
 
+wind: # steady wind in the world frame, resampled every episode; the ground path and speed stay the same
+  enabled: true
+  max_speed: 3.0 # [m/s] horizontal: direction uniform, magnitude uniform in [0, max_speed]
+  max_vertical: 0.0 # [m/s] vertical: uniform in +/- max_vertical
+  privileged: true # append wind / max_speed (3 values) to the teacher's physical parameters
+
+turbulence: # Dryden gusts (linear only), own random sequence per vehicle and episode
+  enabled: true
+  intensities: [light] # drawn per episode from this list: light | moderate | severe
+  burn_in_t: 20.0 # [s] gust filters run before each episode so the gusts start at steady state
+
 observation_space:
   history_len: 100
   state_obs_size: 10
   act_size: 6 # motor R, motor L, aileron R, aileron L, tail R, tail L
-  env_obs_size: 7 # physical parameters given to the teacher
+  env_obs_size: 10 # given to the teacher: 7 physical parameters + 3 wind (when wind.privileged)
   latent_size: 8
 
 dagger: # Phase 2: student regresses the frozen Phase 1 8-dim latent, on-policy
