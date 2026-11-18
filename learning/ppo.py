@@ -563,12 +563,9 @@ class PPO(OnPolicyAlgorithm):
         Entropy coefficient for the loss calculation, by default 0.0
     vf_coef : float, optional
         Value function coefficient for the loss calculation, by default 0.5
-    min_BC_coef : float, optional
-        Minimum BC coefficient for behavior cloning loss, by default 0.5
-    BC_scale : float, optional
-        BC coefficient scale factor, by default 1.0
-    BC_alpha : float, optional
-        BC coefficient decay rate, by default 0.999
+    BC_decay_timesteps : int, optional
+        Env steps (summed over envs) over which the BC coefficient c goes linearly from 1 to 0, then stays 0,
+        by default 5e5. The loss is (1 - c) * PPO + c * BC.
     max_grad_norm : float, optional
         The maximum value for the gradient clipping, by default 0.5
     use_sde : bool, optional
@@ -612,9 +609,7 @@ class PPO(OnPolicyAlgorithm):
         clip_range_vf: Union[None, float, Callable] = None,
         ent_coef: float = 0.0,
         vf_coef: float = 0.5,
-        min_BC_coef: float = 0.5,
-        BC_scale: float = 1.0,
-        BC_alpha: float = 0.999,
+        BC_decay_timesteps: int = 500000,
         max_grad_norm: float = 0.5,
         use_sde: bool = False,
         sde_sample_freq: int = -1,
@@ -686,9 +681,7 @@ class PPO(OnPolicyAlgorithm):
         self.target_kl = target_kl
         
         # Behavior cloning parameters
-        self.min_BC_coef = min_BC_coef
-        self.BC_alpha = BC_alpha
-        self.BC_scale = BC_scale
+        self.BC_decay_timesteps = BC_decay_timesteps
 
         self.env_cfg = env_cfg
         if _init_setup_model:
@@ -707,6 +700,12 @@ class PPO(OnPolicyAlgorithm):
                     "pass `None` to deactivate vf clipping"
                 )
             self.clip_range_vf = get_schedule_fn(self.clip_range_vf)
+
+    def bc_coef(self) -> float:
+        """BC weight c: linear from 1 to 0 over BC_decay_timesteps env steps, then 0."""
+        if self.BC_decay_timesteps <= 0:
+            return 0.0
+        return float(max(0.0, 1.0 - self.num_timesteps / float(self.BC_decay_timesteps)))
 
     def train(self) -> None:
         """
@@ -731,6 +730,7 @@ class PPO(OnPolicyAlgorithm):
         pg_losses, value_losses = [], []
         BC_losses = []
         clip_fractions = []
+        bc_coef = self.bc_coef()  # fixed for this update, from the env steps collected so far
 
         # Train for n_epochs epochs
         for epoch in range(self.n_epochs):
@@ -784,9 +784,9 @@ class PPO(OnPolicyAlgorithm):
 
                 # Combine losses
                 loss = (
-                    min(1, 1-self.BC_scale*self.BC_alpha**self._n_updates) * (
+                    (1.0 - bc_coef) * (
                         policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
-                    ) + max(0, self.BC_scale*self.BC_alpha**self._n_updates) * BC_loss
+                    ) + bc_coef * BC_loss
                 )
 
                 # Optimization step
@@ -826,8 +826,8 @@ class PPO(OnPolicyAlgorithm):
         wandb.log({'train/value_loss': np.mean(value_losses)}, step=self.num_timesteps)
         self.logger.record("train/BC_loss", np.mean(BC_losses))
         wandb.log({'train/BC_loss': np.mean(BC_losses)}, step=self.num_timesteps)
-        self.logger.record("train/BC_coeff", max(self.min_BC_coef, self.BC_scale*self.BC_alpha**self._n_updates))
-        wandb.log({'train/BC_coeff': max(self.min_BC_coef, self.BC_scale*self.BC_alpha**self._n_updates)}, step=self.num_timesteps)
+        self.logger.record("train/BC_coeff", bc_coef)
+        wandb.log({'train/BC_coeff': bc_coef}, step=self.num_timesteps)
         self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
         wandb.log({'train/approx_kl': np.mean(approx_kl_divs)}, step=self.num_timesteps)
         self.logger.record("train/clip_fraction", np.mean(clip_fractions))

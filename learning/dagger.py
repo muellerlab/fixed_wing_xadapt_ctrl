@@ -1,12 +1,12 @@
-"""Phase 2: DAgger for the history student.
+"""Phase 2: DAgger for the history encoder.
 
-The Phase 1 policy is frozen. Its trunk (mlp_extractor.shared_net) maps the 23-dim observation, which
-includes the privileged physical parameters e, to an 8-dim latent z. The student sees the current
-[x_t, a_{t-1}] and the history before it, never e, and is trained to output the same z:
+The Phase 1 PartitionedPolicy (learning/policy.py) is frozen. Its intrinsics encoder maps the privileged
+e to z; its actor takes [x_t, a_{t-1}] and z. The student (history encoder) sees only the history of
+[x_k, a_{k-1}], k = t-history_len ... t-1, never e, and is trained to output the same z:
 
-    teacher: z  = shared_net(x_t, a_{t-1}, e)
-    student: ẑ  = student(x_t, a_{t-1}, history)
-    action      = action_net(policy_net(ẑ))      frozen Phase 1 head
+    teacher label: z = env_net(e)
+    student:       ẑ = encoder(history)
+    action           = action_net(policy_net([x_t, a_{t-1}], ẑ))      frozen Phase 1 actor
 
 On-policy DAgger: the student flies from the first iteration, the teacher labels every visited state
 with z, and the data is used for one round of updates (no aggregation across iterations).
@@ -27,27 +27,30 @@ from stable_baselines3.common.utils import safe_mean
 
 
 class FrozenHead(nn.Module):
-    """Phase 1 policy_net + action_net (with its Tanh): 8-dim latent -> deterministic action in [-1, 1]."""
+    """Phase 1 actor: policy_net on [x_t, a_{t-1}] and a latent, then action_net (with its Tanh)
+    -> deterministic action in [-1, 1]."""
 
     def __init__(self, teacher):
         super(FrozenHead, self).__init__()
         self.policy_net = teacher.mlp_extractor.policy_net
         self.action_net = teacher.action_net
 
-    def forward(self, z):
-        return th.clamp(self.action_net(self.policy_net(z)), -1.0, 1.0)
+    def forward(self, state, z):
+        return th.clamp(self.action_net(self.policy_net(th.cat((state, z), dim=1))), -1.0, 1.0)
 
 
 class DeployPolicy(nn.Module):
-    """Student + frozen head: normalised student input -> action. This is what gets flown after training."""
+    """History encoder + frozen actor: normalised [x_t, a_{t-1} (step_size) | history] -> action.
+    This is what gets flown after training."""
 
-    def __init__(self, student, head):
+    def __init__(self, encoder, head, step_size):
         super(DeployPolicy, self).__init__()
-        self.student = student
+        self.encoder = encoder
         self.head = head
+        self.step_size = step_size
 
     def forward(self, x):
-        return self.head(self.student(x))
+        return self.head(x[:, :self.step_size], self.encoder(x[:, self.step_size:]))
 
 
 def next_run_dir(root, prefix="Student"):
@@ -62,10 +65,10 @@ class DAGGER:
     """
     Parameters
     ----------
-    teacher : ActorCriticPolicy
+    teacher : PartitionedPolicy
         Phase 1 policy, loaded with its Tanh-wrapped action_net. Frozen here.
     student : nn.Module
-        Maps the student input ([x_t, a_{t-1}] + history) to the 8-dim latent.
+        History encoder: flattened history -> ẑ (latent_size), see module.make_history_encoder.
     env, eval_env : TrirotorEnv
         Built with with_history=True, with the Phase 1 RMS loaded and update_running_rms = False.
     cfg : dict
@@ -99,8 +102,8 @@ class DAGGER:
         self.optimizer = th.optim.Adam(self.student.parameters(), lr=self.learning_rate)
 
         self.obs_size = env.obs_size  # [x_t, a_{t-1}, e]: the teacher's input
-        self.step_size = env.state_size + env.act_size  # [x_t, a_{t-1}]
-        self.student_input_size = self.step_size + env.history_size
+        self.step_size = env.state_size + env.act_size  # [x_t, a_{t-1}]: the actor's state input
+        self.student_input_size = env.history_size  # the encoder sees the history only
         self.latent_size = int(cfg["observation_space"]["latent_size"])
 
         self.num_timesteps = 0
@@ -111,12 +114,13 @@ class DAGGER:
     # ---- observation split and the frozen teacher ----
 
     def _split(self, obs):
-        """Env observation -> (teacher input [x_t, a_{t-1}, e], student input [x_t, a_{t-1}, history])."""
+        """Env observation -> ([x_t, a_{t-1}], teacher input [x_t, a_{t-1}, e], history)."""
         obs = th.as_tensor(obs, device=self.device)
-        return obs[:, :self.obs_size], th.cat((obs[:, :self.step_size], obs[:, self.obs_size:]), dim=1)
+        return obs[:, :self.step_size], obs[:, :self.obs_size], obs[:, self.obs_size:]
 
     def teacher_latent(self, teacher_obs):
-        return self.teacher.mlp_extractor.shared_net(self.teacher.extract_features(teacher_obs))
+        """z = env_net(e) of the frozen Phase 1 policy."""
+        return self.teacher.mlp_extractor.latent(self.teacher.extract_features(teacher_obs))
 
     def _sync(self):
         if self.device.type == "cuda":
@@ -135,12 +139,12 @@ class DAGGER:
         for k in range(self.n_steps):
             start = time.perf_counter()
             with th.no_grad():
-                teacher_obs, student_obs = self._split(obs)
+                state, teacher_obs, history = self._split(obs)
                 z = self.teacher_latent(teacher_obs)
-                actions = self.head(self.student(student_obs))
+                actions = self.head(state, self.student(history))
                 self._sync()
             inference_time += time.perf_counter() - start
-            inputs[k] = student_obs.cpu().numpy()
+            inputs[k] = history.cpu().numpy()
             targets[k] = z.cpu().numpy()
 
             start = time.perf_counter()
@@ -184,10 +188,10 @@ class DAGGER:
         path = {key: [] for key in path_keys}
         obs = env.reset()
         while len(returns) < self.n_eval_episodes:
-            teacher_obs, student_obs = self._split(obs)
+            state, teacher_obs, history = self._split(obs)
             z = self.teacher_latent(teacher_obs)
-            z_hat = self.student(student_obs)
-            teacher_action, student_action = self.head(z), self.head(z_hat)
+            z_hat = self.student(history)
+            teacher_action, student_action = self.head(state, z), self.head(state, z_hat)
             z_errors.append(F.mse_loss(z_hat, z).item())
             action_gaps.append(F.mse_loss(student_action, teacher_action).item())
             actions = teacher_action if teacher_flies else student_action
@@ -214,15 +218,15 @@ class DAGGER:
     # ---- saving ----
 
     def save(self, iteration):
-        """Student weights, the TorchScript deploy policy (student input -> action) and the RMS used."""
+        """Encoder weights, the TorchScript deploy policy ([x_t, a_{t-1} | history] -> action) and the RMS used."""
         student_dir = os.path.join(self.log_dir, "Student")
         deploy_dir = os.path.join(self.log_dir, "Deploy")
         os.makedirs(student_dir, exist_ok=True)
         os.makedirs(deploy_dir, exist_ok=True)
         th.save(self.student.state_dict(), os.path.join(student_dir, "iter_{:05d}.pth".format(iteration)))
 
-        deploy = DeployPolicy(self.student, self.head).eval()
-        example = th.zeros(1, self.student_input_size, device=self.device)
+        deploy = DeployPolicy(self.student, self.head, self.step_size).eval()
+        example = th.zeros(1, self.step_size + self.student_input_size, device=self.device)
         with th.no_grad():
             graph = th.jit.trace(deploy, example)
         th.jit.save(graph, os.path.join(deploy_dir, "iter_{:05d}.pt".format(iteration)))

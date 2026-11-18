@@ -1,4 +1,3 @@
-import torch as th
 import torch.nn as nn
 
 
@@ -68,22 +67,29 @@ class StateHistoryEncoder(nn.Module):
         return output
 
 
-class HistoryLatentStudent(nn.Module):
-    """Phase 2 student: [x_t, a_{t-1}] plus the history before it -> estimate of the Phase 1 8-dim latent.
+class MLPHistoryEncoder(nn.Module):
+    """Phase 2 encoder: flattened history of [x_k, a_{k-1}], k = t-history_len ... t-1 (oldest first)
+    -> ẑ, an estimate of the Phase 1 latent z = env_net(e). Tanh output, like z."""
 
-    Input is one flat vector: the current step (step_size) followed by history_len past steps, oldest
-    first, each [x_k, a_{k-1}]. The frozen Phase 1 policy_net / action_net fly on the output.
-    """
+    def __init__(self, step_size, history_len, latent_size, hidden=(256, 128)):
+        super(MLPHistoryEncoder, self).__init__()
+        layers, size = [], step_size * history_len
+        for width in hidden:
+            layers += [nn.Linear(size, width), nn.Tanh()]
+            size = width
+        layers += [nn.Linear(size, latent_size), nn.Tanh()]
+        self.net = nn.Sequential(*layers)
 
-    def __init__(self, step_size, history_len, latent_size, history_features=64, hidden=128):
-        super(HistoryLatentStudent, self).__init__()
-        self.step_size = step_size
-        self.history_encoder = StateHistoryEncoder(nn.Tanh, step_size, history_len, history_features)
-        self.head = nn.Sequential(
-            nn.Linear(step_size + history_features, hidden), nn.Tanh(),
-            nn.Linear(hidden, latent_size), nn.Tanh(),  # the Phase 1 latent is a Tanh output too
-        )
+    def forward(self, history):
+        return self.net(history)
 
-    def forward(self, x):
-        current, history = x[:, :self.step_size], x[:, self.step_size:]
-        return self.head(th.cat((current, self.history_encoder(history)), dim=1))
+
+def make_history_encoder(cfg):
+    """History encoder from hyperparam.yaml (dagger.encoder). Only the MLP exists for now; CNN (e.g. the
+    StateHistoryEncoder above) and RNN versions plug in here."""
+    space, enc = cfg["observation_space"], cfg["dagger"]["encoder"]
+    step_size = int(space["state_obs_size"]) + int(space["act_size"])
+    if enc["type"] == "mlp":
+        return MLPHistoryEncoder(step_size, int(space["history_len"]), int(space["latent_size"]),
+                                 [int(w) for w in enc["hidden"]])
+    raise NotImplementedError("history encoder type '{}' is not implemented yet".format(enc["type"]))
